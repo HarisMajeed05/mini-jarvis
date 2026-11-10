@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="a11y_desc">Lets Jarvis press Send or the call button in WhatsApp, only right after you confirm an action inside Jarvis. It cannot see any other app.</string>
+    <string name="widget_label">Talk to Jarvis</string>
+    <string name="widget_desc">Open Jarvis and start listening</string>
+    <string name="shortcut_talk">Talk</string>
+    <string name="shortcut_talk_long">Talk to Jarvis</string>
 </resources>

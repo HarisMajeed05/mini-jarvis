@@ -3,6 +3,7 @@ package com.jarvis.personal
 import android.app.AlertDialog
 import android.content.Context
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -24,18 +25,49 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 // My colors. A quiet ink canvas with one warm gold accent, so the voice orb is the only thing that glows.
+// The palette is swapped by apply() before any screen is built, dark by default, light or follow the system.
 object C {
-    val BG = Color.parseColor("#101417")        // canvas, about 60% of every screen
-    val SURFACE = Color.parseColor("#171C21")   // panels, one step up
-    val SURFACE2 = Color.parseColor("#1F262C")  // inputs and my own messages
-    val STROKE = Color.parseColor("#2B353D")    // 1dp borders and hairlines
-    val TEXT = Color.parseColor("#E8ECEF")
-    val MUTED = Color.parseColor("#93A0AA")
-    val ACCENT = Color.parseColor("#E6B65C")    // the only accent, actions and the orb
-    val ACCENT_SOFT = Color.parseColor("#2B2415")
-    val INK = Color.parseColor("#1A1405")       // text on top of the accent
-    val GOOD = Color.parseColor("#6CCB9B")
-    val BAD = Color.parseColor("#F0837A")
+    var light = false
+    var BG = 0        // canvas, about 60% of every screen
+    var SURFACE = 0   // panels, one step up
+    var SURFACE2 = 0  // inputs and my own messages
+    var STROKE = 0    // 1dp borders and hairlines
+    var TEXT = 0
+    var MUTED = 0
+    var ACCENT = 0    // the only accent, actions and active states
+    var ACCENT_SOFT = 0
+    var INK = 0       // text on top of the accent
+    var GOOD = 0
+    var BAD = 0
+    var TRACK_ON = 0  // switch track when on
+    val ORB = Color.parseColor("#E6B65C") // the orb keeps its glow in both themes
+
+    init { palette(false) }
+
+    private fun palette(l: Boolean) {
+        light = l
+        if (!l) {
+            BG = Color.parseColor("#101417"); SURFACE = Color.parseColor("#171C21"); SURFACE2 = Color.parseColor("#1F262C")
+            STROKE = Color.parseColor("#2B353D"); TEXT = Color.parseColor("#E8ECEF"); MUTED = Color.parseColor("#93A0AA")
+            ACCENT = Color.parseColor("#E6B65C"); ACCENT_SOFT = Color.parseColor("#2B2415"); INK = Color.parseColor("#1A1405")
+            GOOD = Color.parseColor("#6CCB9B"); BAD = Color.parseColor("#F0837A"); TRACK_ON = Color.parseColor("#6B5528")
+        } else {
+            // gold is too pale for text on white, so the light accent is a deeper amber that keeps 4.5:1
+            BG = Color.parseColor("#F3F5F7"); SURFACE = Color.parseColor("#FFFFFF"); SURFACE2 = Color.parseColor("#E9EDF0")
+            STROKE = Color.parseColor("#D3DAE0"); TEXT = Color.parseColor("#151A1E"); MUTED = Color.parseColor("#56636D")
+            ACCENT = Color.parseColor("#8A5F00"); ACCENT_SOFT = Color.parseColor("#F6EBD0"); INK = Color.parseColor("#FFFFFF")
+            GOOD = Color.parseColor("#1E7A4F"); BAD = Color.parseColor("#B3261E"); TRACK_ON = Color.parseColor("#D9B96A")
+        }
+    }
+
+    fun apply(ctx: Context) {
+        val pick = ctx.getSharedPreferences("jarvis", Context.MODE_PRIVATE).getString("theme", "dark")
+        val night = (ctx.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        palette(when (pick) { "light" -> true; "system" -> !night; else -> false })
+    }
+
+    fun dialogTheme() =
+        if (light) android.R.style.Theme_DeviceDefault_Light_Dialog_Alert else android.R.style.Theme_DeviceDefault_Dialog_Alert
 }
 
 // My type scale. Three sizes for reading, two steps up for titles. Nothing below 12.
@@ -68,7 +100,7 @@ fun Context.bubbleBg(color: Int) = GradientDrawable().apply {
 }
 
 fun Context.ripple(bg: Drawable, r: Int): Drawable =
-    RippleDrawable(ColorStateList.valueOf(Color.argb(40, 255, 255, 255)), bg, roundBg(Color.WHITE, r))
+    RippleDrawable(ColorStateList.valueOf(if (C.light) Color.argb(30, 0, 0, 0) else Color.argb(40, 255, 255, 255)), bg, roundBg(Color.WHITE, r))
 
 fun lp(w: Int, h: Int, wt: Float = 0f) = LinearLayout.LayoutParams(w, h, wt)
 
@@ -139,7 +171,7 @@ fun AlertDialog.showThemed(ctx: Context, danger: Boolean = false) {
 
 // Small line icons I draw myself on a 24 unit grid, so every icon has the same stroke and no emoji is needed.
 class IconView(ctx: Context, private val kind: IconView.Kind, tint: Int) : View(ctx) {
-    enum class Kind { MIC, PRACTICE, PROGRESS, SETTINGS, SEND, CLOSE, CHEVRON }
+    enum class Kind { MIC, PRACTICE, PROGRESS, SETTINGS, SEND, CLOSE, CHEVRON, BACK, HISTORY }
 
     var tint: Int = tint
         set(v) { field = v; invalidate() }
@@ -191,6 +223,14 @@ class IconView(ctx: Context, private val kind: IconView.Kind, tint: Int) : View(
                 path.reset(); path.moveTo(9f * k, 6f * k); path.lineTo(15f * k, 12f * k); path.lineTo(9f * k, 18f * k)
                 canvas.drawPath(path, p)
             }
+            Kind.BACK -> {
+                path.reset(); path.moveTo(15f * k, 6f * k); path.lineTo(9f * k, 12f * k); path.lineTo(15f * k, 18f * k)
+                canvas.drawPath(path, p)
+            }
+            Kind.HISTORY -> {
+                canvas.drawCircle(12f * k, 12f * k, 9f * k, p)
+                line(12f, 7f, 12f, 12f); line(12f, 12f, 16f, 14f)
+            }
         }
     }
 }
@@ -207,6 +247,9 @@ class OrbView(ctx: Context) : View(ctx) {
 
     private val still = ctx.reduceMotion()
     private var smooth = 0f
+    private var kick = 0f // a short beat for every spoken word
+
+    fun pulse() { kick = 1f; if (still) invalidate() }
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val start = System.nanoTime()
     private val wave = Path()
@@ -219,11 +262,12 @@ class OrbView(ctx: Context) : View(ctx) {
 
         val target = when (state) {
             S.LISTEN -> 0.25f + level * 0.75f
-            S.SPEAK -> if (still) 0.5f else 0.4f + 0.25f * (sin(t * 7f) * 0.5f + 0.5f)
+            S.SPEAK -> if (still) 0.5f else 0.38f + 0.08f * (sin(t * 5f) * 0.5f + 0.5f) + 0.3f * kick
             S.THINK -> 0.3f
             S.IDLE -> if (still) 0.12f else 0.12f + 0.05f * sin(t * 1.6f)
         }
-        smooth = if (still) target else smooth + (target - smooth) * 0.12f
+        kick *= 0.88f
+        smooth = if (still) target else smooth + (target - smooth) * 0.18f
         val r = base * (1f + smooth * 0.3f)
 
         // soft glow rings, one hue
@@ -237,7 +281,7 @@ class OrbView(ctx: Context) : View(ctx) {
         // the core
         paint.shader = RadialGradient(
             cx - r * 0.25f, cy - r * 0.3f, r * 1.25f,
-            intArrayOf(Color.parseColor("#F6DDA6"), C.ACCENT, Color.parseColor("#7A5A1C")),
+            intArrayOf(Color.parseColor("#F6DDA6"), C.ORB, Color.parseColor("#7A5A1C")),
             floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
         )
         canvas.drawCircle(cx, cy, r, paint)

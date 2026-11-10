@@ -57,12 +57,15 @@ object Secret {
 object Brain {
     private const val NAME = "Haris"
     private const val API = "https://api.groq.com/openai/v1"
-    private const val CHAT = "openai/gpt-oss-120b"
+    private const val CHAT = "llama-3.3-70b-versatile"
     private const val STT = "whisper-large-v3-turbo"
 
     class Reply(val heard: String, val text: String, val actions: JSONArray)
     class Feedback(val clarity: Int, val curiosity: Int, val warmth: Int, val confidence: Int,
-                   val wins: List<String>, val improve: List<String>, val better: String)
+                   val wins: List<String>, val improve: List<String>, val better: String, val delivery: String = "")
+    class Heard(val text: String, val wpm: Int, val pauses: Int, val fillers: Int)
+    class Entry(val ts: Long, val mine: Boolean, val text: String, val practice: Boolean)
+    class Plan(val week: String, val focus: String, val days: List<String>, val why: String)
 
     const val CHECKIN = "[The daily check in notification was tapped. Greet me briefly and ask how my day was, as $NAME's friend.]"
 
@@ -73,6 +76,8 @@ object Brain {
         "camera" to "com.android.camera", "photos" to "com.google.android.apps.photos",
         "clock" to "com.google.android.deskclock", "settings" to "com.android.settings"
     )
+
+    fun appPackage(name: String): String? = APPS[name.trim().lowercase()]
 
     private val STYLES = mapOf(
         "roman" to "Roman Urdu (Urdu written in English letters), simple words",
@@ -85,7 +90,7 @@ object Brain {
 
     fun reset(c: Context) = prefs(c).edit().clear().apply()
 
-    fun clearPractice(c: Context) = prefs(c).edit().remove("practice").apply()
+    fun clearPractice(c: Context) = prefs(c).edit().remove("practice").remove("pmetrics").apply()
 
     private fun clean(s: String, n: Int) = s.replace(Regex("[\\u0000-\\u001f]"), " ").trim().take(n)
 
@@ -110,7 +115,10 @@ object Brain {
         return con
     }
 
-    private fun transcribe(key: String, audio: File): String {
+    private val FILLERS = setOf("um", "umm", "uh", "uhh", "er", "erm", "hmm", "like", "basically", "actually")
+
+    // verbose_json gives me a timestamp for every word, so I can measure my pace, pauses and fillers
+    private fun transcribe(key: String, audio: File): Heard {
         val b = "jv" + System.nanoTime()
         val con = open("audio/transcriptions", key)
         con.setRequestProperty("Content-Type", "multipart/form-data; boundary=$b")
@@ -118,13 +126,72 @@ object Brain {
             fun field(n: String, v: String) =
                 out.write("--$b\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n".toByteArray())
             field("model", STT)
-            field("response_format", "json")
+            field("response_format", "verbose_json")
+            field("timestamp_granularities[]", "word")
             field("temperature", "0")
             out.write("--$b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n".toByteArray())
             audio.inputStream().use { it.copyTo(out) }
             out.write("\r\n--$b--\r\n".toByteArray())
         }
-        return clean(JSONObject(finish(con)).optString("text", ""), 1000)
+        val o = JSONObject(finish(con))
+        val text = clean(o.optString("text", ""), 1000)
+        val w = o.optJSONArray("words")
+        if (w == null || w.length() < 3) return Heard(text, 0, 0, 0)
+        var pauses = 0
+        var fillers = 0
+        for (i in 0 until w.length()) {
+            val cur = w.getJSONObject(i)
+            if (FILLERS.contains(cur.optString("word").lowercase().filter { it.isLetter() })) fillers++
+            if (i > 0 && cur.optDouble("start") - w.getJSONObject(i - 1).optDouble("end") > 0.8) pauses++
+        }
+        val span = w.getJSONObject(w.length() - 1).optDouble("end") - w.getJSONObject(0).optDouble("start")
+        val wpm = if (span > 1.0) (w.length() / span * 60).toInt() else 0
+        return Heard(text, wpm, pauses, fillers)
+    }
+
+    /** Reads the SSE stream. Content tokens go to onToken, tool call pieces are stitched back together. */
+    private fun stream(key: String, body: JSONObject, onToken: ((String) -> Unit)?): JSONObject {
+        body.put("stream", true)
+        val con = open("chat/completions", key)
+        con.setRequestProperty("Content-Type", "application/json")
+        con.outputStream.use { it.write(body.toString().toByteArray()) }
+        if (con.responseCode != 200) {
+            val e = con.errorStream?.bufferedReader()?.use { it.readText() }?.take(150) ?: ""
+            throw Exception("Groq ${con.responseCode} $e")
+        }
+        val text = StringBuilder()
+        val ids = sortedMapOf<Int, String>()
+        val names = HashMap<Int, String>()
+        val args = HashMap<Int, StringBuilder>()
+        con.inputStream.bufferedReader().useLines { lines ->
+            for (line in lines) {
+                if (!line.startsWith("data:")) continue
+                val d = line.removePrefix("data:").trim()
+                if (d == "[DONE]") break
+                val delta = (try { JSONObject(d).optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta") } catch (e: Exception) { null }) ?: continue
+                val tok = delta.optString("content", "")
+                if (tok.isNotEmpty() && !delta.isNull("content")) { text.append(tok); onToken?.invoke(tok) }
+                val tc = delta.optJSONArray("tool_calls") ?: continue
+                for (i in 0 until tc.length()) {
+                    val t = tc.getJSONObject(i)
+                    val idx = t.optInt("index", 0)
+                    if (t.has("id")) ids[idx] = t.getString("id")
+                    val f = t.optJSONObject("function") ?: continue
+                    if (f.has("name")) names[idx] = f.getString("name")
+                    args.getOrPut(idx) { StringBuilder() }.append(f.optString("arguments", ""))
+                }
+            }
+        }
+        val msg = JSONObject().put("role", "assistant").put("content", text.toString())
+        if (ids.isNotEmpty()) {
+            val calls = JSONArray()
+            for ((idx, id) in ids) {
+                calls.put(JSONObject().put("id", id).put("type", "function").put("function",
+                    JSONObject().put("name", names[idx] ?: "").put("arguments", args[idx]?.toString()?.ifBlank { "{}" } ?: "{}")))
+            }
+            msg.put("tool_calls", calls)
+        }
+        return msg
     }
 
     private fun chat(key: String, body: JSONObject): JSONObject {
@@ -134,21 +201,30 @@ object Brain {
         return JSONObject(finish(con)).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
     }
 
-    private fun turn(key: String, messages: JSONArray, withTools: Boolean): JSONObject {
+    private fun turn(key: String, messages: JSONArray, withTools: Boolean, onToken: ((String) -> Unit)?): JSONObject {
         val body = JSONObject().put("model", CHAT).put("messages", messages).put("temperature", 0.6).put("max_tokens", 400)
         if (withTools) body.put("tools", TOOLS).put("tool_choice", "auto")
-        return chat(key, body)
+        return stream(key, body, onToken)
     }
 
     // ---------- one turn ----------
 
-    fun talk(c: Context, key: String, text: String, audio: File?, style: String, mode: String, hint: String?): Reply {
+    fun talk(c: Context, key: String, text: String, audio: File?, style: String, mode: String, hint: String?,
+             onHeard: ((String) -> Unit)? = null, onToken: ((String) -> Unit)? = null): Reply {
         var heard = clean(text, 1000)
-        if (audio != null) heard = transcribe(key, audio)
+        val practice = mode.startsWith("practice:")
+        if (audio != null) {
+            val h = transcribe(key, audio)
+            heard = h.text
+            if (practice && heard.isNotEmpty() && h.wpm > 0) {
+                val m = arr(c, "pmetrics").put(JSONObject().put("wpm", h.wpm).put("pauses", h.pauses).put("fillers", h.fillers))
+                prefs(c).edit().putString("pmetrics", m.toString()).apply()
+            }
+        }
         if (heard.isEmpty() && hint == null) throw Exception("Nothing heard")
+        if (heard.isNotEmpty()) onHeard?.invoke(heard)
 
         val st = if (STYLES.containsKey(style)) style else "roman"
-        val practice = mode.startsWith("practice:")
         val histKey = if (practice) "practice" else "history"
         val sys = if (practice) practicePrompt(Coach.byId(mode.removePrefix("practice:")), st) else system(c, st)
 
@@ -160,11 +236,11 @@ object Brain {
         val actions = JSONArray()
         var reply = "Sorry, I got stuck. Please try again."
         for (round in 0 until 3) {
-            val m = turn(key, msgs, !practice)
+            val m = turn(key, msgs, !practice, onToken)
             val calls = m.optJSONArray("tool_calls")
-            val content = if (m.isNull("content")) "" else m.getString("content")
+            val content = m.optString("content", "")
             if (calls == null || calls.length() == 0) { reply = content.trim(); break }
-            msgs.put(JSONObject().put("role", "assistant").put("content", content).put("tool_calls", calls))
+            msgs.put(m)
             for (i in 0 until calls.length()) {
                 val call = calls.getJSONObject(i)
                 val fn = call.getJSONObject("function")
@@ -181,7 +257,37 @@ object Brain {
         val kept = JSONArray()
         for (i in maxOf(0, h.length() - 16) until h.length()) kept.put(h.getJSONObject(i))
         prefs(c).edit().putString(histKey, kept.toString()).apply()
+        if (heard.isNotEmpty()) log(c, true, heard, practice)
+        log(c, false, reply, practice)
         return Reply(heard, reply, actions)
+    }
+
+    // ---------- history and memory, both stay on the phone and I can delete them ----------
+
+    private fun log(c: Context, mine: Boolean, text: String, practice: Boolean) {
+        val a = arr(c, "log").put(JSONObject().put("t", System.currentTimeMillis()).put("m", mine).put("x", text).put("p", practice))
+        val kept = JSONArray()
+        for (i in maxOf(0, a.length() - 400) until a.length()) kept.put(a.get(i))
+        prefs(c).edit().putString("log", kept.toString()).apply()
+    }
+
+    fun entries(c: Context): List<Entry> {
+        val a = arr(c, "log")
+        return (0 until a.length()).map {
+            val o = a.getJSONObject(it)
+            Entry(o.getLong("t"), o.getBoolean("m"), o.getString("x"), o.optBoolean("p"))
+        }.reversed()
+    }
+
+    fun clearLog(c: Context) = prefs(c).edit().remove("log").apply()
+
+    fun memory(c: Context): List<String> = arr(c, "memory").let { a -> (0 until a.length()).map { a.getString(it) } }
+
+    fun forget(c: Context, index: Int) {
+        val a = arr(c, "memory")
+        val kept = JSONArray()
+        for (i in 0 until a.length()) if (i != index) kept.put(a.getString(i))
+        prefs(c).edit().putString("memory", kept.toString()).apply()
     }
 
     private fun practicePrompt(s: Coach.Scenario?, style: String): String =
@@ -198,6 +304,14 @@ object Brain {
         for (i in 0 until h.length()) {
             val m = h.getJSONObject(i)
             sb.append(if (m.getString("role") == "user") "User: " else "Partner: ").append(m.getString("content")).append('\n')
+        }
+        val dm = arr(c, "pmetrics")
+        var delivery = ""
+        if (dm.length() > 0) {
+            var wpm = 0; var pauses = 0; var fillers = 0
+            for (i in 0 until dm.length()) { val o = dm.getJSONObject(i); wpm += o.getInt("wpm"); pauses += o.getInt("pauses"); fillers += o.getInt("fillers") }
+            delivery = "Pace ${wpm / dm.length()} words per minute, $pauses long pauses, $fillers filler words"
+            sb.append("\nMeasured delivery of the User's spoken lines: ").append(delivery).append(". Calm speech is about 110 to 160 words per minute.\n")
         }
         val sys = "You are a kind and honest speaking coach for a shy person. Judge ONLY the User's lines in this practice " +
             "conversation (scenario: $scenario). Return JSON only, with integer scores from 1 to 10 for: clarity, " +
@@ -216,7 +330,53 @@ object Brain {
             return (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }.take(3)
         }
         return Feedback(score("clarity"), score("curiosity"), score("warmth"), score("confidence"),
-            list("wins"), list("improve"), o.optString("better", ""))
+            list("wins"), list("improve"), o.optString("better", ""), delivery)
+    }
+
+    // ---------- weekly plan: a planner agent drafts it, a critic agent checks it once ----------
+
+    fun plan(c: Context): Plan? {
+        val o = try { JSONObject(prefs(c).getString("plan", "") ?: "") } catch (e: Exception) { return null }
+        val d = o.optJSONArray("days") ?: return null
+        return Plan(o.optString("week"), o.optString("focus"), (0 until d.length()).map { d.optString(it) }, o.optString("why"))
+    }
+
+    private fun json(key: String, sys: String, user: String): JSONObject {
+        val body = JSONObject().put("model", CHAT).put("temperature", 0.4).put("max_tokens", 700)
+            .put("response_format", JSONObject().put("type", "json_object"))
+            .put("messages", JSONArray()
+                .put(JSONObject().put("role", "system").put("content", sys))
+                .put(JSONObject().put("role", "user").put("content", user)))
+        return JSONObject(chat(key, body).getString("content"))
+    }
+
+    fun makePlan(c: Context, key: String, style: String): Plan {
+        val last = Coach.sessions(c).takeLast(10)
+        val facts = StringBuilder()
+        if (last.isEmpty()) facts.append("No practice sessions yet. ")
+        else {
+            fun m(f: (Coach.Session) -> Int) = String.format(Locale.US, "%.1f", last.map(f).average())
+            facts.append("Last ${last.size} sessions, average clarity ${m { it.clarity }}, curiosity ${m { it.curiosity }}, ")
+                .append("warmth ${m { it.warmth }}, confidence ${m { it.confidence }}. Scenarios: ${last.joinToString { it.scenario }}. ")
+        }
+        facts.append("Day streak ${Coach.streak(c)}, real world streak ${Coach.realStreak(c)}.")
+        val lang = STYLES[if (STYLES.containsKey(style)) style else "roman"]
+        val planner = "You are a planner agent for a shy person who wants better communication skills. Make a 7 day plan " +
+            "(Monday to Sunday) with ONE small doable step per day, mixing short practice sessions and tiny real life steps, " +
+            "never overwhelming, one rest day. Return JSON only: focus (the one skill to work on, short), days (array of 7 short strings), " +
+            "why (one sentence). Write in $lang."
+        val draft = json(key, planner, facts.toString())
+        val critic = "You are a strict critic agent. Check this plan for a shy person: is each day small and specific, is anything " +
+            "too scary or vague, does it fit the data? Return JSON only with the same fields focus, days (7 strings), why, " +
+            "where you fixed every problem you found. Keep the language."
+        val checked = try { json(key, critic, "Data: $facts\nPlan: $draft") } catch (e: Exception) { draft }
+        val src = if ((checked.optJSONArray("days")?.length() ?: 0) == 7) checked else draft
+        val days = src.optJSONArray("days") ?: throw Exception("Plan was empty")
+        val out = JSONObject().put("week", LocalDate.now().toString()).put("focus", clean(src.optString("focus"), 80))
+            .put("why", clean(src.optString("why"), 200))
+            .put("days", JSONArray((0 until minOf(7, days.length())).map { clean(days.optString(it), 140) }))
+        prefs(c).edit().putString("plan", out.toString()).apply()
+        return plan(c) ?: throw Exception("Plan was empty")
     }
 
     private fun system(c: Context, style: String): String {
@@ -258,6 +418,9 @@ object Brain {
         .put(fn("add_reminder", "Save a reminder notification for a date, optionally with a time.",
             JSONObject().put("text", S).put("when", JSONObject().put("type", "string").put("description", "YYYY-MM-DD or YYYY-MM-DDTHH:MM")), listOf("text", "when")))
         .put(fn("remember", "Save a lasting fact about the user (people, plans, likes).", JSONObject().put("fact", S), listOf("fact")))
+        .put(fn("calendar_event", "Open a new calendar event for the user to review and save.",
+            JSONObject().put("title", S).put("start", JSONObject().put("type", "string").put("description", "YYYY-MM-DDTHH:MM")).put("minutes", I), listOf("title", "start")))
+        .put(fn("send_sms", "Prepare a text message (SMS) to a contact. The user reviews it and presses send.", JSONObject().put("name", S).put("message", S), listOf("name", "message")))
 
     private const val CONFIRM = "Sent to the phone. The phone asks the user to confirm before it happens."
 
@@ -295,6 +458,14 @@ object Brain {
                 if (!ok) "Bad date. Use YYYY-MM-DD or YYYY-MM-DDTHH:MM." to null
                 else "Reminder saved on the phone." to act("reminder").put("text", clean(a.optString("text"), 200)).put("at", w)
             }
+            "calendar_event" -> {
+                val st = a.optString("start").trim()
+                val ok = try { LocalDateTime.parse(st); true } catch (e: Exception) { false }
+                if (!ok) "Bad start. Use YYYY-MM-DDTHH:MM." to null
+                else "Calendar editor opens on the phone, the user saves it." to act("calendar").put("title", clean(a.optString("title"), 100))
+                    .put("start", st).put("minutes", a.optInt("minutes", 60).coerceIn(5, 1440))
+            }
+            "send_sms" -> CONFIRM to act("sms").put("name", clean(a.optString("name"), 40)).put("message", clean(a.optString("message"), 500))
             "remember" -> {
                 val mem = arr(c, "memory").put(clean(a.optString("fact"), 200))
                 prefs(c).edit().putString("memory", mem.toString()).apply()

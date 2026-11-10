@@ -2,12 +2,14 @@ package com.jarvis.personal
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
@@ -66,6 +68,15 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private var mode = "friend"   // or "practice:<scenario id>"
     private var scenario: Coach.Scenario? = null
 
+    private var tab = 0
+    private var sub = false          // a page opened from Settings, back returns to the tab
+    private var lastExact = true
+    private var streamTv: TextView? = null
+    private var lastUser: TextView? = null
+    private val streamText = StringBuilder()
+    private val sentence = StringBuilder()
+    private var pendingPass: CharArray? = null
+
     private var startedAt = 0L
     private var lastVoice = 0L
     private var heardVoice = false
@@ -73,24 +84,69 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+        C.apply(this)
+        setTheme(if (C.light) android.R.style.Theme_DeviceDefault_Light_NoActionBar else android.R.style.Theme_DeviceDefault_NoActionBar)
         paintBars()
         buildShell()
         buildTalk()
         tts = TextToSpeech(this, this)
+        lastExact = Reminders.canExact(this)
+        Reminders.ensureCheckin(this)
 
+        // first run: explain before asking for anything, people who already added a key skip it
+        if (!prefs.getBoolean("onboarded", false) && apiKey().isBlank()) {
+            showOnboarding()
+        } else {
+            askPermissions()
+            go(savedInstanceState?.getInt("tab") ?: if (apiKey().isBlank()) 3 else 0)
+        }
+        handleIntent(intent)
+    }
+
+    private fun askPermissions() {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_CONTACTS, Manifest.permission.CALL_PHONE)
         if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
         requestPermissions(perms.toTypedArray(), 1)
+    }
 
-        Reminders.ensureCheckin(this)
-        go(if (apiKey().isBlank()) 3 else 0)
-        handleIntent(intent)
+    private fun showOnboarding() {
+        tabBar.visibility = View.GONE
+        content.removeAllViews()
+        content.addView(Screens(this).onboarding {
+            prefs.edit().putBoolean("onboarded", true).apply()
+            tabBar.visibility = View.VISIBLE
+            askPermissions()
+            go(3)
+        })
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt("tab", tab)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // if I just allowed exact alarms in Android settings, move every reminder onto the exact clock
+        if (Build.VERSION.SDK_INT >= 31) {
+            val now = Reminders.canExact(this)
+            if (now != lastExact) { lastExact = now; Reminders.rescheduleAll(this) }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (sub) back() else super.onBackPressed()
     }
 
     @Suppress("DEPRECATION")
     private fun paintBars() {
         window.statusBarColor = C.BG
         window.navigationBarColor = C.SURFACE
+        // dark icons on the light theme, light icons on the dark one
+        val bits = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        val f = window.decorView.systemUiVisibility
+        window.decorView.systemUiVisibility = if (C.light) f or bits else f and bits.inv()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -105,6 +161,14 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             i.removeExtra("checkin")
             go(0)
             send("", null, Brain.CHECKIN)
+        }
+        // the home screen widget and the launcher shortcut open Jarvis already listening
+        if (i?.getBooleanExtra("mic", false) == true) {
+            i.removeExtra("mic")
+            if (apiKey().isNotBlank()) {
+                go(0)
+                if (!busy && recorder == null) { holdLive = false; startRecording() }
+            }
         }
     }
 
@@ -160,6 +224,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     // keepScroll is for settings changes, so the page does not jump back to the top
     fun go(i: Int, keepScroll: Boolean = false) {
+        tab = i
+        sub = false
         val oldY = (content.getChildAt(0) as? ScrollView)?.scrollY ?: 0
         content.removeAllViews()
         val v = when (i) {
@@ -181,6 +247,15 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
     }
 
+    // a page opened from a tab, like history or memory, back returns to that tab
+    fun push(v: View) {
+        content.removeAllViews()
+        content.addView(v)
+        sub = true
+    }
+
+    fun back() = go(tab)
+
     // ---------- the talk screen ----------
 
     private fun buildTalk() {
@@ -192,6 +267,15 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         modeLabel = label("Friend chat", T.META, C.MUTED)
         titles.addView(modeLabel)
         top.addView(titles, lp(0, -2, 1f))
+        val hist = FrameLayout(this).apply {
+            contentDescription = "Chat history"
+            background = ripple(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT), 24)
+            isClickable = true
+            isFocusable = true
+            addView(IconView(this@MainActivity, IconView.Kind.HISTORY, C.TEXT), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
+            setOnClickListener { push(Screens(this@MainActivity).history()) }
+        }
+        top.addView(hist, lp(dp(48), dp(48)).apply { rightMargin = dp(8) })
         liveChip = chip("Hands-free off") { setLive(!live) }.apply { contentDescription = "Hands-free mode" }
         top.addView(liveChip)
         talk.addView(top, lp(-1, -2))
@@ -271,7 +355,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     // my words sit in a bubble on the right, Jarvis talks as plain text on the left like a transcript
-    private fun bubble(mine: Boolean, msg: String) {
+    private fun bubble(mine: Boolean, msg: String): TextView {
         emptyView.visibility = View.GONE
         val tv = label(msg, T.BODY, C.TEXT).apply {
             maxWidth = (resources.displayMetrics.widthPixels * (if (mine) 0.8f else 0.92f)).toInt()
@@ -290,6 +374,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         chatBox.addView(tv, lp(-2, -2).apply { gravity = if (mine) Gravity.END else Gravity.START; topMargin = dp(12) })
         while (chatBox.childCount > 80) chatBox.removeViewAt(1)
         scrollDown()
+        return tv
     }
 
     // a failed request says what happened, what to do next, and keeps the details for support
@@ -341,6 +426,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {}
             override fun onDone(id: String?) { ui.post { spokeOne() } }
+            // every spoken word gives the orb a small beat, Android does not expose the real waveform
+            override fun onRangeStart(id: String?, start: Int, end: Int, frame: Int) { ui.post { orb.pulse() } }
             @Deprecated("Deprecated in Java")
             override fun onError(id: String?) { ui.post { spokeOne() } }
         })
@@ -368,7 +455,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     // one sentence finished, when the queue is empty the orb relaxes and live mode listens again
     private fun spokeOne() {
         spoken = maxOf(0, spoken - 1)
-        if (spoken > 0) return
+        if (spoken > 0 || busy) return // while the reply is still streaming the orb keeps its shape
         idle()
         if (live && !busy && !holdLive && recorder == null) startRecording()
     }
@@ -464,6 +551,20 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     fun apiKey(): String = try { Secret.open(prefs.getString("gkey", "") ?: "") } catch (e: Exception) { "" }
 
+    // tokens arrive while Jarvis is still thinking, so the reply is written live and each sentence is spoken as soon as it is whole
+    private fun feed(tok: String) {
+        streamText.append(tok)
+        val tv = streamTv
+        if (tv == null) streamTv = bubble(false, streamText.toString()) else { tv.text = streamText; scrollDown() }
+        sentence.append(tok)
+        val s = sentence.toString()
+        val cut = s.indexOfLast { it == '.' || it == '!' || it == '?' || it == '\n' || it == '\u06D4' }
+        if (cut >= 15) {
+            speak(s.substring(0, cut + 1).trim())
+            sentence.delete(0, cut + 1)
+        }
+    }
+
     private fun send(text: String, audio: File?, hint: String?) {
         val key = apiKey()
         if (key.isBlank()) { setStatus("Add your Groq key to start"); go(3); return }
@@ -472,10 +573,18 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         setStatus("Thinking")
         val st = style()
         val md = mode
+        streamTv = null
+        lastUser = null
+        streamText.setLength(0)
+        sentence.setLength(0)
         thread {
             var reply: Brain.Reply? = null
             var error = ""
-            try { reply = Brain.talk(this, key, text, audio, st, md, hint) } catch (e: Exception) { error = e.message ?: "error" }
+            try {
+                reply = Brain.talk(this, key, text, audio, st, md, hint,
+                    { h -> ui.post { lastUser = bubble(true, h) } },
+                    { t -> ui.post { feed(t) } })
+            } catch (e: Exception) { error = e.message ?: "error" }
             audio?.delete()
             val r = reply
             val err = error
@@ -483,19 +592,109 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 busy = false
                 if (r == null) {
                     setLive(false)
+                    tts?.stop()
+                    spoken = 0
                     idle()
-                    val again: (() -> Unit)? = if (text.isNotEmpty() || hint != null) ({ send(text, null, hint) }) else null
+                    // typed simple commands still work with no internet
+                    val off = if (text.isNotEmpty()) Actions.offline(text) else null
+                    if (off != null) {
+                        streamTv?.let { chatBox.removeView(it) }
+                        holdLive = true
+                        bubble(false, "I cannot reach Groq, so I did that on the phone.")
+                        Actions.run(this, off) { msg -> bubble(false, msg); speak(msg) }
+                        return@post
+                    }
+                    val half = streamTv
+                    val user = lastUser
+                    if (half != null) chatBox.removeView(half)
+                    val again: (() -> Unit)? = if (text.isNotEmpty() || hint != null) ({
+                        if (user != null) chatBox.removeView(user)
+                        send(text, null, hint)
+                    }) else null
                     errorRow("Jarvis could not answer",
                         if (again != null) "Check your connection and your Groq key in Settings, then try again."
                         else "Check your connection and your Groq key in Settings, then tap the orb and speak again.",
                         err, again)
                     return@post
                 }
-                if (r.heard.isNotEmpty()) bubble(true, r.heard)
-                bubble(false, r.text)
                 holdLive = r.actions.length() > 0
-                speak(r.text)
+                val tv = streamTv
+                if (tv == null) {
+                    if (r.text.isNotBlank()) { bubble(false, r.text); speak(r.text) }
+                } else {
+                    if (r.text.isNotBlank()) tv.text = r.text
+                    val rest = sentence.toString().trim()
+                    if (rest.isNotEmpty()) speak(rest)
+                }
                 Actions.run(this, r.actions) { msg -> bubble(false, msg); speak(msg) }
+                // nothing left to say, so go back to rest, or listen again in hands-free mode
+                if (spoken == 0 && !holdLive) {
+                    idle()
+                    if (live && recorder == null) startRecording()
+                }
+            }
+        }
+    }
+
+    // ---------- encrypted backup ----------
+
+    private fun askPass(title: String, msg: String, ok: String, min: Int, done: (CharArray) -> Unit) {
+        val e = EditText(this).apply {
+            hint = "Passphrase"
+            textSize = T.BODY
+            setTextColor(C.TEXT)
+            setHintTextColor(C.MUTED)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val frame = FrameLayout(this).apply { setPadding(dp(24), dp(8), dp(24), 0); addView(e) }
+        AlertDialog.Builder(this, C.dialogTheme()).setTitle(title).setMessage(msg).setView(frame)
+            .setPositiveButton(ok) { _, _ ->
+                val p = CharArray(e.text.length).also { e.text.getChars(0, e.text.length, it, 0) }
+                e.setText("")
+                if (p.size < min) { p.fill('\u0000'); Toast.makeText(this, "Use at least $min characters", Toast.LENGTH_SHORT).show() }
+                else done(p)
+            }
+            .setNegativeButton("Cancel", null).create().showThemed(this)
+    }
+
+    fun exportBackup() {
+        askPass("Export backup", "Choose a passphrase of at least 8 characters. You need it to restore, and it is not saved anywhere.", "Choose file", 8) { p ->
+            pendingPass = p
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, "jarvis-backup.jvb"), 41)
+        }
+    }
+
+    fun importBackup() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 42)
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri: Uri? = data?.data
+        if (requestCode == 41) {
+            val p = pendingPass
+            pendingPass = null
+            if (p == null) return
+            if (resultCode != RESULT_OK || uri == null) { p.fill('\u0000'); return }
+            thread {
+                var err = ""
+                try { Backup.write(this, uri, p) } catch (e: Exception) { err = "Could not save the backup. Try another location." }
+                p.fill('\u0000')
+                ui.post { Toast.makeText(this, if (err.isEmpty()) "Backup saved" else err, Toast.LENGTH_LONG).show() }
+            }
+        } else if (requestCode == 42 && resultCode == RESULT_OK && uri != null) {
+            askPass("Import backup", "Enter the passphrase you used when you exported. This replaces your current chats, progress and reminders.", "Import backup", 1) { p ->
+                thread {
+                    var err = ""
+                    try { Backup.read(this, uri, p) } catch (e: Exception) { err = e.message ?: "Could not read the backup" }
+                    p.fill('\u0000')
+                    ui.post {
+                        Toast.makeText(this, if (err.isEmpty()) "Backup restored" else err, Toast.LENGTH_LONG).show()
+                        if (err.isEmpty()) recreate()
+                    }
+                }
             }
         }
     }

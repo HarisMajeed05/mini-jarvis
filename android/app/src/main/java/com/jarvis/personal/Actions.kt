@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.AlarmClock
+import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.widget.Toast
@@ -76,6 +77,27 @@ object Actions {
     private fun l2On(act: Activity) =
         act.getSharedPreferences("jarvis", Context.MODE_PRIVATE).getBoolean("l2", true) && WhatsAppService.connected
 
+    /** Simple commands that work without internet. Anything that needs real understanding returns null. */
+    fun offline(text: String): JSONArray? {
+        val t = text.trim().lowercase()
+        fun act(type: String) = JSONObject().put("type", type)
+        Regex("^(open|launch|start) (\\w+)$").find(t)?.let { m ->
+            val pkg = Brain.appPackage(m.groupValues[2]) ?: return null
+            return JSONArray().put(act("open_app").put("package", pkg))
+        }
+        Regex("^(set )?(a )?timer (for )?(\\d{1,3}) ?(min|mins|minutes|minute)$").find(t)?.let { m ->
+            val n = m.groupValues[4].toInt()
+            if (n in 1..600) return JSONArray().put(act("timer").put("minutes", n).put("label", "Jarvis"))
+        }
+        Regex("^(set )?(an )?alarm (for |at )?(\\d{1,2})(:(\\d{2}))?$").find(t)?.let { m ->
+            val h = m.groupValues[4].toInt()
+            val min = m.groupValues[6].ifEmpty { "0" }.toInt()
+            if (h in 0..23 && min in 0..59) return JSONArray().put(act("alarm").put("hour", h).put("minute", min).put("label", "Jarvis"))
+        }
+        Regex("^call (.{1,40})$").find(t)?.let { return JSONArray().put(act("call").put("name", it.groupValues[1])) }
+        return null
+    }
+
     /** Runs the actions one after another. Calls and messages wait for my yes first. */
     fun run(act: Activity, list: JSONArray, say: (String) -> Unit) {
         fun step(i: Int) {
@@ -99,7 +121,7 @@ object Actions {
             yes(); next(); return
         }
         // the button says what will happen, and Cancel has the focus
-        AlertDialog.Builder(act, android.R.style.Theme_DeviceDefault_Dialog_Alert).setMessage(msg).setCancelable(false)
+        AlertDialog.Builder(act, C.dialogTheme()).setMessage(msg).setCancelable(false)
             .setPositiveButton(ok) { _, _ ->
                 try { yes() } catch (e: Exception) { Toast.makeText(act, "That action failed", Toast.LENGTH_SHORT).show() }
                 next()
@@ -182,6 +204,24 @@ object Actions {
                     .putExtra(AlarmClock.EXTRA_MESSAGE, a.optString("label", "Jarvis"))
                     .putExtra(AlarmClock.EXTRA_SKIP_UI, true))
                 next()
+            }
+            "calendar" -> {
+                val start = java.time.LocalDateTime.parse(a.getString("start")).atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                // the calendar app shows the event and I press Save myself
+                act.startActivity(Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI)
+                    .putExtra(CalendarContract.Events.TITLE, a.getString("title"))
+                    .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, start)
+                    .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, start + a.optInt("minutes", 60) * 60_000L))
+                next()
+            }
+            "sms" -> {
+                val c = pick(act, a.getString("name"), say) ?: return next()
+                val text = a.getString("message")
+                confirm(act, "Text ${c.name}:\n\n\"$text\"", "Open message", next) {
+                    // no SMS permission needed, the messaging app opens with the text typed and I press send
+                    act.startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:+${c.number}")).putExtra("sms_body", text))
+                    say("The message is typed in. Press send.")
+                }
             }
             "reminder" -> {
                 if (!Reminders.addFromText(act, a.getString("text"), a.getString("at"))) say("I could not set that reminder time.")

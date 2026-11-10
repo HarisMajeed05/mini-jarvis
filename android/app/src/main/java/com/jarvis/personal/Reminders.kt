@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDate
@@ -89,11 +90,15 @@ object Reminders {
         setCheckin(c, true, checkinHour(c), checkinMinute(c))
     }
 
+    fun canExact(c: Context) = Build.VERSION.SDK_INT < 31 || c.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()
+
     private fun schedule(c: Context, id: Int, text: String, at: Long, daily: Boolean) {
         val i = Intent(c, AlarmReceiver::class.java).putExtra("id", id).putExtra("text", text).putExtra("daily", daily)
         val pi = PendingIntent.getBroadcast(c, id, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        // inexact on purpose, the exact alarm permission is not worth it for a reminder
-        c.getSystemService(AlarmManager::class.java).setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+        val am = c.getSystemService(AlarmManager::class.java)
+        // exact when I allowed it in Android settings, otherwise Android may delay it a few minutes
+        if (canExact(c)) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+        else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
     }
 
     fun rescheduleAll(c: Context) {
