@@ -57,7 +57,7 @@ object Secret {
 object Brain {
     private const val NAME = "Haris"
     private const val API = "https://api.groq.com/openai/v1"
-    private const val CHAT = "llama-3.3-70b-versatile"
+    private const val CHAT = "openai/gpt-oss-120b"
     private const val STT = "whisper-large-v3-turbo"
 
     class Reply(val heard: String, val text: String, val actions: JSONArray)
