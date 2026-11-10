@@ -94,24 +94,25 @@ object Actions {
         step(0)
     }
 
-    private fun confirm(act: Activity, msg: String, next: () -> Unit, yes: () -> Unit) {
+    private fun confirm(act: Activity, msg: String, ok: String, next: () -> Unit, yes: () -> Unit) {
         if (!act.getSharedPreferences("jarvis", Context.MODE_PRIVATE).getBoolean("confirm", true)) {
             yes(); next(); return
         }
-        AlertDialog.Builder(act).setMessage(msg).setCancelable(false)
-            .setPositiveButton("Yes") { _, _ ->
+        // the button says what will happen, and Cancel has the focus
+        AlertDialog.Builder(act, android.R.style.Theme_DeviceDefault_Dialog_Alert).setMessage(msg).setCancelable(false)
+            .setPositiveButton(ok) { _, _ ->
                 try { yes() } catch (e: Exception) { Toast.makeText(act, "That action failed", Toast.LENGTH_SHORT).show() }
                 next()
             }
-            .setNegativeButton("No") { _, _ -> next() }
-            .show()
+            .setNegativeButton("Cancel") { _, _ -> next() }
+            .create().showThemed(act)
     }
 
     private fun exec(act: Activity, a: JSONObject, say: (String) -> Unit, next: () -> Unit) {
         when (a.getString("type")) {
             "call" -> {
                 val c = pick(act, a.getString("name"), say) ?: return next()
-                confirm(act, "Call ${c.name}?", next) {
+                confirm(act, "Call ${c.name}?", "Call", next) {
                     val granted = act.checkSelfPermission(android.Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
                     // without the call permission I fall back to the dialer, where I press call myself
                     act.startActivity(Intent(if (granted) Intent.ACTION_CALL else Intent.ACTION_DIAL, Uri.parse("tel:+${c.number}")))
@@ -120,7 +121,7 @@ object Actions {
             "whatsapp_message" -> {
                 val c = pick(act, a.getString("name"), say) ?: return next()
                 val text = a.getString("message")
-                confirm(act, "WhatsApp to ${c.name}:\n\n\"$text\"", next) {
+                confirm(act, "WhatsApp to ${c.name}:\n\n\"$text\"", "Send message", next) {
                     val auto = l2On(act)
                     if (auto) WhatsAppService.arm(WhatsAppService.Kind.SEND, text)
                     act.startActivity(chatIntent(c, text))
@@ -129,7 +130,7 @@ object Actions {
             }
             "whatsapp_call" -> {
                 val c = pick(act, a.getString("name"), say) ?: return next()
-                confirm(act, "WhatsApp call ${c.name}?", next) {
+                confirm(act, "WhatsApp call ${c.name}?", "Start call", next) {
                     val uri = whatsappCallUri(act, c.name)
                     if (uri != null) {
                         act.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "vnd.android.cursor.item/vnd.com.whatsapp.voip.call").setPackage(WA))

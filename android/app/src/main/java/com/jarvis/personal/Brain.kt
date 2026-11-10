@@ -57,10 +57,14 @@ object Secret {
 object Brain {
     private const val NAME = "Haris"
     private const val API = "https://api.groq.com/openai/v1"
-    private const val CHAT = "openai/gpt-oss-120b"
+    private const val CHAT = "llama-3.3-70b-versatile"
     private const val STT = "whisper-large-v3-turbo"
 
     class Reply(val heard: String, val text: String, val actions: JSONArray)
+    class Feedback(val clarity: Int, val curiosity: Int, val warmth: Int, val confidence: Int,
+                   val wins: List<String>, val improve: List<String>, val better: String)
+
+    const val CHECKIN = "[The daily check in notification was tapped. Greet me briefly and ask how my day was, as $NAME's friend.]"
 
     // only these apps can ever be opened
     private val APPS = mapOf(
@@ -80,6 +84,8 @@ object Brain {
     private fun arr(c: Context, k: String) = JSONArray(prefs(c).getString(k, "[]"))
 
     fun reset(c: Context) = prefs(c).edit().clear().apply()
+
+    fun clearPractice(c: Context) = prefs(c).edit().remove("practice").apply()
 
     private fun clean(s: String, n: Int) = s.replace(Regex("[\\u0000-\\u001f]"), " ").trim().take(n)
 
@@ -121,32 +127,40 @@ object Brain {
         return clean(JSONObject(finish(con)).optString("text", ""), 1000)
     }
 
-    private fun chat(key: String, messages: JSONArray): JSONObject {
+    private fun chat(key: String, body: JSONObject): JSONObject {
         val con = open("chat/completions", key)
         con.setRequestProperty("Content-Type", "application/json")
-        val body = JSONObject().put("model", CHAT).put("messages", messages).put("tools", TOOLS)
-            .put("tool_choice", "auto").put("temperature", 0.6).put("max_tokens", 400)
         con.outputStream.use { it.write(body.toString().toByteArray()) }
         return JSONObject(finish(con)).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
     }
 
+    private fun turn(key: String, messages: JSONArray, withTools: Boolean): JSONObject {
+        val body = JSONObject().put("model", CHAT).put("messages", messages).put("temperature", 0.6).put("max_tokens", 400)
+        if (withTools) body.put("tools", TOOLS).put("tool_choice", "auto")
+        return chat(key, body)
+    }
+
     // ---------- one turn ----------
 
-    fun talk(c: Context, key: String, text: String, audio: File?, opened: Boolean, style: String): Reply {
+    fun talk(c: Context, key: String, text: String, audio: File?, style: String, mode: String, hint: String?): Reply {
         var heard = clean(text, 1000)
         if (audio != null) heard = transcribe(key, audio)
-        if (heard.isEmpty() && !opened) throw Exception("Nothing heard")
+        if (heard.isEmpty() && hint == null) throw Exception("Nothing heard")
 
-        val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", system(c, if (STYLES.containsKey(style)) style else "roman")))
-        val past = arr(c, "history")
+        val st = if (STYLES.containsKey(style)) style else "roman"
+        val practice = mode.startsWith("practice:")
+        val histKey = if (practice) "practice" else "history"
+        val sys = if (practice) practicePrompt(Coach.byId(mode.removePrefix("practice:")), st) else system(c, st)
+
+        val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", sys))
+        val past = arr(c, histKey)
         for (i in 0 until past.length()) msgs.put(past.getJSONObject(i))
-        msgs.put(JSONObject().put("role", "user").put("content",
-            heard.ifEmpty { "[The daily check in notification was tapped. Greet me briefly and ask how my day was, as $NAME's friend.]" }))
+        msgs.put(JSONObject().put("role", "user").put("content", heard.ifEmpty { hint ?: "" }))
 
         val actions = JSONArray()
         var reply = "Sorry, I got stuck. Please try again."
         for (round in 0 until 3) {
-            val m = chat(key, msgs)
+            val m = turn(key, msgs, !practice)
             val calls = m.optJSONArray("tool_calls")
             val content = if (m.isNull("content")) "" else m.getString("content")
             if (calls == null || calls.length() == 0) { reply = content.trim(); break }
@@ -160,14 +174,49 @@ object Brain {
             }
         }
 
-        // keep the last 16 messages of chat so the friend remembers the conversation
-        val h = arr(c, "history")
+        // keep the last 16 messages of each chat so the friend remembers the conversation
+        val h = arr(c, histKey)
         if (heard.isNotEmpty()) h.put(JSONObject().put("role", "user").put("content", heard))
         h.put(JSONObject().put("role", "assistant").put("content", reply))
         val kept = JSONArray()
         for (i in maxOf(0, h.length() - 16) until h.length()) kept.put(h.getJSONObject(i))
-        prefs(c).edit().putString("history", kept.toString()).apply()
+        prefs(c).edit().putString(histKey, kept.toString()).apply()
         return Reply(heard, reply, actions)
+    }
+
+    private fun practicePrompt(s: Coach.Scenario?, style: String): String =
+        "You are role playing as ${s?.role ?: "a friendly person"} The user is a shy person practicing a real conversation. " +
+            "Stay fully in character, speak naturally in 1 or 2 short sentences, be warm and realistic, and ask easy " +
+            "follow up questions so the talk keeps flowing. Never coach, never break character, never mention being an AI. " +
+            "Reply in ${STYLES[style]}."
+
+    /** Scores only my lines of the last practice session. Returns kind but honest feedback. */
+    fun evaluate(c: Context, key: String, scenario: String, style: String): Feedback {
+        val h = arr(c, "practice")
+        if (h.length() < 4) throw Exception("Talk a little more first, then finish")
+        val sb = StringBuilder()
+        for (i in 0 until h.length()) {
+            val m = h.getJSONObject(i)
+            sb.append(if (m.getString("role") == "user") "User: " else "Partner: ").append(m.getString("content")).append('\n')
+        }
+        val sys = "You are a kind and honest speaking coach for a shy person. Judge ONLY the User's lines in this practice " +
+            "conversation (scenario: $scenario). Return JSON only, with integer scores from 1 to 10 for: clarity, " +
+            "curiosity (asked questions, showed interest), warmth, confidence. Also: wins (array of 2 short strings), " +
+            "improve (array of 2 short specific tips) and better (one of the User's lines rewritten better, as a string). " +
+            "Do not inflate scores. Write the text in ${STYLES[style]}."
+        val body = JSONObject().put("model", CHAT).put("temperature", 0.3).put("max_tokens", 500)
+            .put("response_format", JSONObject().put("type", "json_object"))
+            .put("messages", JSONArray()
+                .put(JSONObject().put("role", "system").put("content", sys))
+                .put(JSONObject().put("role", "user").put("content", sb.toString())))
+        val o = JSONObject(chat(key, body).getString("content"))
+        fun score(k: String) = o.optInt(k, 5).coerceIn(1, 10)
+        fun list(k: String): List<String> {
+            val a = o.optJSONArray(k) ?: return emptyList()
+            return (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }.take(3)
+        }
+        return Feedback(score("clarity"), score("curiosity"), score("warmth"), score("confidence"),
+            list("wins"), list("improve"), o.optString("better", ""))
     }
 
     private fun system(c: Context, style: String): String {

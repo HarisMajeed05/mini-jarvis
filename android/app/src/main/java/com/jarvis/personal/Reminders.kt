@@ -17,13 +17,24 @@ import java.time.ZoneId
 // My reminders and the daily check in. Stored on the phone, rescheduled after a reboot.
 object Reminders {
     private const val CHECKIN_ID = 1
-    private const val CHECKIN_HOUR = 20 // I want the daily "how was your day" at 8 pm
+    private const val CHECKIN_TEXT = "How was your day? Tap to talk."
+
+    class Item(val id: Int, val text: String, val at: Long, val daily: Boolean)
 
     private fun prefs(c: Context) = c.getSharedPreferences("reminders", Context.MODE_PRIVATE)
+    private fun cfg(c: Context) = c.getSharedPreferences("checkin", Context.MODE_PRIVATE)
     private fun load(c: Context) = JSONArray(prefs(c).getString("list", "[]"))
     private fun save(c: Context, a: JSONArray) = prefs(c).edit().putString("list", a.toString()).apply()
 
     private fun millis(t: LocalDateTime) = t.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+    fun list(c: Context): List<Item> {
+        val a = load(c)
+        return (0 until a.length()).map {
+            val o = a.getJSONObject(it)
+            Item(o.getInt("id"), o.getString("text"), o.getLong("at"), o.getBoolean("daily"))
+        }.sortedBy { it.at }
+    }
 
     /** at is 'YYYY-MM-DD' (I default that to 9 am) or 'YYYY-MM-DDTHH:MM'. Returns false for bad or past times. */
     fun addFromText(c: Context, text: String, at: String): Boolean {
@@ -47,12 +58,35 @@ object Reminders {
         schedule(c, id, text, at, daily)
     }
 
-    fun ensureCheckin(c: Context) {
+    fun remove(c: Context, id: Int) {
         val list = load(c)
-        for (i in 0 until list.length()) if (list.getJSONObject(i).getInt("id") == CHECKIN_ID) return
-        var t = LocalDate.now().atTime(CHECKIN_HOUR, 0)
+        val kept = JSONArray()
+        for (i in 0 until list.length()) if (list.getJSONObject(i).getInt("id") != id) kept.put(list.getJSONObject(i))
+        save(c, kept)
+        val pi = PendingIntent.getBroadcast(c, id, Intent(c, AlarmReceiver::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_NO_CREATE)
+        if (pi != null) {
+            c.getSystemService(AlarmManager::class.java).cancel(pi)
+            pi.cancel()
+        }
+    }
+
+    fun checkinOn(c: Context) = cfg(c).getBoolean("on", true)
+    fun checkinHour(c: Context) = cfg(c).getInt("h", 20) // I want the daily "how was your day" at 8 pm by default
+    fun checkinMinute(c: Context) = cfg(c).getInt("m", 0)
+
+    fun setCheckin(c: Context, on: Boolean, hour: Int, minute: Int) {
+        cfg(c).edit().putBoolean("on", on).putInt("h", hour).putInt("m", minute).apply()
+        if (!on) { remove(c, CHECKIN_ID); return }
+        var t = LocalDate.now().atTime(hour, minute)
         if (millis(t) <= System.currentTimeMillis()) t = t.plusDays(1)
-        add(c, "How was your day? Tap to talk.", millis(t), true, CHECKIN_ID)
+        add(c, CHECKIN_TEXT, millis(t), true, CHECKIN_ID)
+    }
+
+    fun ensureCheckin(c: Context) {
+        if (!checkinOn(c)) return
+        if (list(c).any { it.id == CHECKIN_ID }) return
+        setCheckin(c, true, checkinHour(c), checkinMinute(c))
     }
 
     private fun schedule(c: Context, id: Int, text: String, at: Long, daily: Boolean) {
@@ -98,9 +132,7 @@ object Reminders {
 
 class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val id = intent.getIntExtra("id", 0)
-        // a one shot reminder is removed from storage right away so a reboot cannot fire it twice
-        Reminders.fire(context, id, intent.getStringExtra("text") ?: "")
+        Reminders.fire(context, intent.getIntExtra("id", 0), intent.getStringExtra("text") ?: "")
     }
 }
 
