@@ -1,9 +1,6 @@
-.env
-*.db
-__pycache__/
-.venv/
 android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
 *.apk
+.env

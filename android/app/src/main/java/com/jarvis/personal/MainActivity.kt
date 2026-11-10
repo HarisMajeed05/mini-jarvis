@@ -23,10 +23,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import org.json.JSONObject
 import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.Locale
 import kotlin.concurrent.thread
 
@@ -61,7 +58,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         requestPermissions(perms.toTypedArray(), 1)
 
         Reminders.ensureCheckin(this)
-        if (prefs.getString("url", "").isNullOrBlank()) showSettings() else handleIntent(intent)
+        if (apiKey().isBlank()) showSettings() else handleIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -194,74 +191,31 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         if (heardVoice) send("", File(cacheDir, "voice.m4a"), false) else setStatus("Did not hear anything")
     }
 
-    // ---------- talking to my server ----------
+    // ---------- talking to Groq (straight from the phone, no server) ----------
+
+    private fun apiKey(): String = try { Secret.open(prefs.getString("gkey", "") ?: "") } catch (e: Exception) { "" }
 
     private fun send(text: String, audio: File?, opened: Boolean) {
-        val base = (prefs.getString("url", "") ?: "").trim().trimEnd('/')
-        val token = (prefs.getString("token", "") ?: "").trim()
-        // https only, my token must never travel in plain text
-        if (!base.startsWith("https://") || token.isEmpty()) { setStatus("Open Settings: https URL and token needed"); return }
+        val key = apiKey()
+        if (key.isBlank()) { setStatus("Open Settings and add your Groq key"); return }
         busy = true
         setStatus("Thinking...")
+        val st = style()
         thread {
-            var json: JSONObject? = null
+            var reply: Brain.Reply? = null
             var error = ""
-            try { json = post(base, token, text, audio, opened) } catch (e: Exception) { error = e.message ?: "error" }
+            try { reply = Brain.talk(this, key, text, audio, opened, st) } catch (e: Exception) { error = e.message ?: "error" }
             audio?.delete()
-            val result = json
+            val r = reply
             val err = error
             ui.post {
                 busy = false
-                if (result == null) { setStatus("Failed: $err"); return@post }
-                val heard = result.optString("heard")
-                val reply = result.getString("reply")
-                if (heard.isNotEmpty()) add("Me", heard)
-                add("Jarvis", reply)
-                speak(reply)
+                if (r == null) { setStatus("Failed: $err"); return@post }
+                if (r.heard.isNotEmpty()) add("Me", r.heard)
+                add("Jarvis", r.text)
+                speak(r.text)
                 setStatus("Tap the mic and talk")
-                Actions.run(this, result.getJSONArray("actions")) { msg -> add("Jarvis", msg); speak(msg) }
-            }
-        }
-    }
-
-    private fun post(base: String, token: String, text: String, audio: File?, opened: Boolean): JSONObject {
-        val boundary = "jv" + System.nanoTime()
-        val con = URL("$base/api/talk").openConnection() as HttpURLConnection
-        con.requestMethod = "POST"
-        con.doOutput = true
-        con.connectTimeout = 15000
-        con.readTimeout = 45000
-        con.setRequestProperty("Authorization", "Bearer $token")
-        con.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-        con.outputStream.use { out ->
-            fun field(n: String, v: String) {
-                out.write("--$boundary\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n".toByteArray())
-            }
-            field("text", text)
-            field("style", style())
-            field("opened", opened.toString())
-            if (audio != null) {
-                out.write(("--$boundary\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"voice.m4a\"\r\n" +
-                    "Content-Type: audio/mp4\r\n\r\n").toByteArray())
-                audio.inputStream().use { it.copyTo(out) }
-                out.write("\r\n".toByteArray())
-            }
-            out.write("--$boundary--\r\n".toByteArray())
-        }
-        if (con.responseCode != 200) throw Exception("HTTP ${con.responseCode}")
-        return JSONObject(con.inputStream.bufferedReader().use { it.readText() })
-    }
-
-    private fun forgetEverything(base: String, token: String) {
-        thread {
-            try {
-                val con = URL("$base/api/reset").openConnection() as HttpURLConnection
-                con.requestMethod = "POST"
-                con.setRequestProperty("Authorization", "Bearer $token")
-                val ok = con.responseCode == 200
-                ui.post { setStatus(if (ok) "Memory cleared" else "Reset failed") }
-            } catch (e: Exception) {
-                ui.post { setStatus("Reset failed") }
+                Actions.run(this, r.actions) { msg -> add("Jarvis", msg); speak(msg) }
             }
         }
     }
@@ -270,9 +224,9 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun showSettings() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
-        val url = EditText(this).apply { hint = "Server URL (https://...)"; setText(prefs.getString("url", "")); inputType = InputType.TYPE_TEXT_VARIATION_URI }
-        val token = EditText(this).apply {
-            hint = "Access token"; setText(prefs.getString("token", ""))
+        // I never show the saved key again, leaving this empty keeps the old one
+        val key = EditText(this).apply {
+            hint = if (apiKey().isBlank()) "Groq API key" else "Groq API key (saved, leave empty to keep)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         val confirm = CheckBox(this).apply { text = "Ask before calls and messages"; isChecked = prefs.getBoolean("confirm", true) }
@@ -292,19 +246,17 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         val forget = Button(this).apply {
             text = "Forget everything Jarvis knows"
-            setOnClickListener {
-                forgetEverything(url.text.toString().trim().trimEnd('/'), token.text.toString().trim())
-            }
+            setOnClickListener { Brain.reset(this@MainActivity); setStatus("Memory cleared") }
         }
-        for (v in listOf(url, token, confirm, l2, a11y, lang, forget)) box.addView(v)
+        for (v in listOf(key, confirm, l2, a11y, lang, forget)) box.addView(v)
 
         AlertDialog.Builder(this).setTitle("Settings").setView(ScrollView(this).apply { addView(box) })
             .setPositiveButton("Save") { _, _ ->
+                val k = key.text.toString().trim()
                 prefs.edit()
-                    .putString("url", url.text.toString().trim())
-                    .putString("token", token.text.toString().trim())
                     .putBoolean("confirm", confirm.isChecked)
                     .putBoolean("l2", l2.isChecked)
+                    .apply { if (k.isNotEmpty()) putString("gkey", Secret.seal(k)) }
                     .apply()
             }
             .setNegativeButton("Close", null)
