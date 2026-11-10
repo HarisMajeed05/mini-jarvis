@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="a11y_desc">Lets Jarvis press Send or the call button in WhatsApp, only right after you confirm an action inside Jarvis. It cannot see any other app.</string>
+</resources>
