@@ -43,7 +43,7 @@ class Screens(private val a: MainActivity) {
             tappable(b) { a.back() }
             col.addView(b, lp(a.dp(48), a.dp(48)).apply { bottomMargin = a.dp(8) })
         }
-        col.addView(a.label(title, T.H1, C.TEXT, true))
+        col.addView(a.voice(title, T.H1))
         col.addView(a.label(sub, T.SEC, C.MUTED), lp(-1, -2).apply { topMargin = a.dp(4) })
         val sv = ScrollView(a).apply { addView(col); isVerticalScrollBarEnabled = false }
         return sv to col
@@ -73,15 +73,17 @@ class Screens(private val a: MainActivity) {
 
         section(col, "Today")
         val today = pad(a.panel())
-        today.addView(a.label(pick.title, T.H2, C.TEXT, true))
+        today.addView(a.voice(pick.title, T.H2))
         today.addView(a.label(pick.blurb, T.SEC, C.MUTED), lp(-1, -2).apply { topMargin = a.dp(4) })
         today.addView(a.label("Level ${pick.level} of 3", T.META, C.MUTED), lp(-1, -2).apply { topMargin = a.dp(8) })
         today.addView(a.button("Start practice", 1) { a.startPractice(pick) }, lp(-1, -2).apply { topMargin = a.dp(16) })
         col.addView(today, lp(-1, -2))
 
-        section(col, "All scenarios")
+        // grouped by how hard they feel, so I can pick my own step
+        for ((level, name) in listOf(1 to "Easy", 2 to "A bit harder", 3 to "Brave")) {
+        section(col, name)
         val list = a.panel()
-        Coach.ALL.forEachIndexed { i, s ->
+        Coach.ALL.filter { it.level == level }.forEachIndexed { i, s ->
             if (i > 0) list.addView(a.hairline(), lp(-1, 1))
             val row = LinearLayout(a).apply {
                 gravity = Gravity.CENTER_VERTICAL
@@ -92,12 +94,12 @@ class Screens(private val a: MainActivity) {
             mid.addView(a.label(s.title, T.BODY, C.TEXT, true))
             mid.addView(a.label(s.blurb, T.SEC, C.MUTED))
             row.addView(mid, lp(0, -2, 1f))
-            row.addView(a.label("Level ${s.level}", T.META, C.MUTED).apply { setPadding(a.dp(8), 0, a.dp(4), 0) })
-            row.addView(IconView(a, IconView.Kind.CHEVRON, C.MUTED), lp(a.dp(24), a.dp(24)))
+            row.addView(IconView(a, IconView.Kind.CHEVRON, C.MUTED), lp(a.dp(24), a.dp(24)).apply { leftMargin = a.dp(8) })
             tappable(row) { a.startPractice(s) }
             list.addView(row, lp(-1, -2))
         }
         col.addView(list, lp(-1, -2))
+        }
         return sv
     }
 
@@ -250,7 +252,7 @@ class Screens(private val a: MainActivity) {
             isClickable = false
             isFocusable = false
             thumbTintList = tint(C.ACCENT, C.MUTED)
-            trackTintList = tint(C.TRACK_ON, C.STROKE)
+            trackTintList = tint(C.ACCENT_SOFT, C.SURFACE2)
             setOnCheckedChangeListener { _, b -> change(b) }
         }
         val r = row(name, sub, C.MUTED, sw)
@@ -270,6 +272,8 @@ class Screens(private val a: MainActivity) {
             if (saved) C.GOOD else C.BAD,
             a.button(if (saved) "Change key" else "Add key", if (saved) 0 else 1) { keyDialog() }))
         col.addView(conn, lp(-1, -2))
+
+        voiceSection(col)
 
         // safety
         section(col, "Safety")
@@ -399,6 +403,50 @@ class Screens(private val a: MainActivity) {
         }, lp(-1, -2).apply { topMargin = a.dp(16) })
         col.addView(pr, lp(-1, -2))
         return sv
+    }
+
+    // ---------------- Voice: wake word, continuous talk, speech recognition ----------------
+
+    private fun choice(col: LinearLayout, title: String, sub: String, options: List<Pair<String, String>>, current: String, pick: (String) -> Unit) {
+        val box = a.panel()
+        box.addView(row(title, sub))
+        val chips = LinearLayout(a).apply { setPadding(a.dp(8), 0, a.dp(8), a.dp(8)) }
+        for ((id, name) in options) {
+            chips.addView(a.chip(name, current == id) { pick(id); a.go(3, true) }, lp(0, -2, 1f).apply { leftMargin = a.dp(4); rightMargin = a.dp(4) })
+        }
+        box.addView(chips, lp(-1, -2))
+        col.addView(box, lp(-1, -2).apply { topMargin = a.dp(12) })
+    }
+
+    private fun voiceSection(col: LinearLayout) {
+        section(col, "Voice")
+        val v = a.panel()
+        if (WakeService.modelInApk(a)) {
+            v.addView(switchRow("Wake word", "Jarvis listens for the phrase on this phone, even with the app closed. It uses some battery.",
+                WakeService.enabled(a)) { a.setWake(it) })
+        } else {
+            v.addView(row("Wake word", "Not part of this build. Build the APK with the GitHub workflow to add it."))
+        }
+        v.addView(a.hairline(), lp(-1, 1))
+        val pop = WakeService.canPopUp(a)
+        v.addView(row("Open when it hears you", if (pop) "Allowed" else "Off. You get a notification to tap instead.", if (pop) C.GOOD else C.MUTED,
+            if (pop) null else a.button("Allow") {
+                a.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + a.packageName)))
+            }))
+        v.addView(a.hairline(), lp(-1, 1))
+        v.addView(switchRow("Answer on the lock screen", "Talking works while locked. Calls, messages and apps wait until you unlock.",
+            a.prefs.getBoolean("lock", false)) { a.prefs.edit().putBoolean("lock", it).apply() })
+        v.addView(a.hairline(), lp(-1, 1))
+        v.addView(switchRow("Keep the conversation going", "Jarvis listens again after each reply, no tap needed",
+            a.continuous()) { a.prefs.edit().putBoolean("cont", it).apply() })
+        col.addView(v, lp(-1, -2))
+
+        choice(col, "Wake phrase", "Pick another one if yours is missed", WakeService.PHRASES.map { it to it.replaceFirstChar { c -> c.uppercase() } },
+            WakeService.phrase(a)) { a.prefs.edit().putString("wake_phrase", it).apply(); a.restartWake() }
+        choice(col, "I speak", "Telling Jarvis your language makes it hear you better",
+            listOf("mix" to "Urdu + English", "en" to "English", "auto" to "Detect"), Brain.speech(a)) { a.prefs.edit().putString("speech", it).apply() }
+        choice(col, "Hearing", "Accurate takes a moment longer",
+            listOf("best" to "Most accurate", "fast" to "Fastest"), a.prefs.getString("stt", "best") ?: "best") { a.prefs.edit().putString("stt", it).apply() }
     }
 
     // ---------------- Weekly plan (planner agent, then a critic agent) ----------------
@@ -561,7 +609,7 @@ class Screens(private val a: MainActivity) {
         val (sv, col) = page("Meet Jarvis", "A voice friend that helps you get easier with people.")
         val points = a.panel()
         listOf(
-            "Talk any time" to "Tap the orb and speak. Jarvis answers out loud and remembers what matters to you.",
+            "Talk any time" to "Tap the mic or say the wake word. Jarvis answers out loud and remembers what matters to you.",
             "Practice real moments" to "Rehearse a hello or a phone call, then get honest, kind feedback on how it went.",
             "You stay in control" to "Calls and messages always wait for your yes. Your key and chats never leave this phone."
         ).forEachIndexed { i, (t, d) ->

@@ -3,14 +3,16 @@ package com.jarvis.personal
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.KeyguardManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.net.Uri
+import android.graphics.Rect
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -25,12 +27,13 @@ import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONArray
 import java.io.File
+import java.time.LocalTime
 import java.util.Locale
 import kotlin.concurrent.thread
 
@@ -45,47 +48,63 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     // shell
     private lateinit var content: FrameLayout
     private lateinit var tabBar: LinearLayout
+    private var tab = 0
+    private var sub = false // a page opened from a tab, back returns to the tab
 
-    // talk screen, built once so the chat survives tab changes
+    // talk screen, built once so the conversation survives tab changes
     private lateinit var talk: LinearLayout
-    private lateinit var orb: OrbView
+    private lateinit var line: VoiceLine
+    private lateinit var micBtn: FrameLayout
+    private lateinit var micIcon: IconView
     private lateinit var status: TextView
     private lateinit var modeLabel: TextView
-    private lateinit var liveChip: TextView
+    private lateinit var histBtn: View
     private lateinit var chatBox: LinearLayout
     private lateinit var chatScroll: ScrollView
     private lateinit var emptyView: View
-    private lateinit var promptRow: HorizontalScrollView
     private lateinit var practiceBar: LinearLayout
     private lateinit var input: EditText
+    private lateinit var stage: View
+    private var typing = false     // the keyboard is up, so the voice line and tabs step aside
 
+    // voice out
     private var tts: TextToSpeech? = null
-    private var recorder: MediaRecorder? = null
-    private var busy = false
-    private var live = false      // hands free: listen again after Jarvis finishes talking
-    private var holdLive = false  // a call or message needs my yes, so do not open the mic
-    private var spoken = 0
-    private var mode = "friend"   // or "practice:<scenario id>"
-    private var scenario: Coach.Scenario? = null
+    private var ttsReady = false
+    private var spoken = 0   // sentences still in the speech queue
+    private var gen = 0      // goes up every time I cut Jarvis off, so late callbacks are ignored
 
-    private var tab = 0
-    private var sub = false          // a page opened from Settings, back returns to the tab
-    private var lastExact = true
+    // voice in
+    private var recorder: MediaRecorder? = null
+    private var starting = false   // waiting a moment for the wake word service to let go of the mic
+    private var followUp = false   // this listen came by itself after a reply, so silence is not an error
+    private var startedAt = 0L
+    private var lastVoice = 0L
+    private var heardVoice = false
+    private var floor = 0          // how loud the room is, measured as the recording starts
+    private var misses = 0
+
+    // conversation
+    private var busy = false
+    private var holdLive = false   // a call or message needs my yes, so do not open the mic
+    private var turnOpen = false
+    private var voiceTurn = false  // only a spoken turn makes Jarvis listen again by itself
+    private var resumed = false
+    private var mode = "friend"    // or "practice:<scenario id>"
+    private var scenario: Coach.Scenario? = null
     private var streamTv: TextView? = null
     private var lastUser: TextView? = null
     private val streamText = StringBuilder()
     private val sentence = StringBuilder()
-    private var pendingPass: CharArray? = null
 
-    private var startedAt = 0L
-    private var lastVoice = 0L
-    private var heardVoice = false
+    private var lastExact = true
+    private var pendingPass: CharArray? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
         C.apply(this)
         setTheme(if (C.light) android.R.style.Theme_DeviceDefault_Light_NoActionBar else android.R.style.Theme_DeviceDefault_NoActionBar)
+        overLock(intent)
         paintBars()
         buildShell()
         buildTalk()
@@ -106,7 +125,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private fun askPermissions() {
         val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_CONTACTS, Manifest.permission.CALL_PHONE)
         if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
-        requestPermissions(perms.toTypedArray(), 1)
+        val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
     }
 
     private fun showOnboarding() {
@@ -127,13 +147,41 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     override fun onResume() {
         super.onResume()
+        resumed = true
+        WakeService.appVisible = true
+        WakeService.onWake = { wake() }
+        // the wake word service can only be started while I am on screen
+        if (WakeService.enabled(this) && !WakeService.running) WakeService.start(this)
         // if I just allowed exact alarms in Android settings, move every reminder onto the exact clock
         if (Build.VERSION.SDK_INT >= 31) {
             val now = Reminders.canExact(this)
             if (now != lastExact) { lastExact = now; Reminders.rescheduleAll(this) }
         }
+        applyLock()
+        if (tab == 3 && !sub) go(3, true) // permissions may have changed while I was in Android settings
+        if (recorder == null && !busy && spoken == 0 && !starting) idle()
     }
 
+    override fun onPause() {
+        // never keep my own mic open in the background, the wake word service takes over again
+        resumed = false
+        WakeService.appVisible = false
+        WakeService.onWake = null
+        ui.removeCallbacks(beginRun)
+        starting = false
+        abortRecording()
+        stopSpeech()
+        if (Build.VERSION.SDK_INT >= 27) setShowWhenLocked(false)
+        syncWake()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        tts?.shutdown()
+        super.onDestroy()
+    }
+
+    @Deprecated("Deprecated in Java")
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
         if (sub) back() else super.onBackPressed()
@@ -152,38 +200,64 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        overLock(intent)
         handleIntent(intent)
     }
 
-    // tapping the daily notification starts the check in by itself
+    // ---------- lock screen ----------
+
+    private fun locked() = getSystemService(KeyguardManager::class.java).isKeyguardLocked
+
+    // Only when the wake word opened me and I switched this on in Settings. Talking works over the lock
+    // screen, but the tabs stay hidden and every phone action waits until I unlock.
+    private fun overLock(i: Intent?) {
+        if (Build.VERSION.SDK_INT >= 27 && i?.getBooleanExtra("wake", false) == true && prefs.getBoolean("lock", false)) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
+    }
+
+    private fun applyLock() {
+        val l = locked()
+        if (l && (tab != 0 || sub)) go(0)
+        tabBar.visibility = if (l || typing || (!prefs.getBoolean("onboarded", false) && apiKey().isBlank())) View.GONE else View.VISIBLE
+        stage.visibility = if (typing) View.GONE else View.VISIBLE
+        status.visibility = if (typing) View.GONE else View.VISIBLE
+        histBtn.visibility = if (l) View.INVISIBLE else View.VISIBLE
+    }
+
+    private fun runActions(list: JSONArray) {
+        if (list.length() == 0) return
+        val say: (String) -> Unit = { msg -> bubble(false, msg); speak(msg) }
+        if (!locked()) { Actions.run(this, list, say); return }
+        say("Unlock the phone and I will do that.")
+        getSystemService(KeyguardManager::class.java).requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+            override fun onDismissSucceeded() { ui.post { applyLock(); Actions.run(this@MainActivity, list, say) } }
+        })
+    }
+
+    // ---------- intents: daily check in, widget, shortcut, wake word ----------
+
     private fun handleIntent(i: Intent?) {
         if (i?.getBooleanExtra("checkin", false) == true) {
             i.removeExtra("checkin")
             go(0)
             send("", null, Brain.CHECKIN)
         }
-        // the home screen widget and the launcher shortcut open Jarvis already listening
         if (i?.getBooleanExtra("mic", false) == true) {
             i.removeExtra("mic")
-            if (apiKey().isNotBlank()) {
-                go(0)
-                if (!busy && recorder == null) { holdLive = false; startRecording() }
-            }
+            i.removeExtra("wake")
+            ui.post { wake() } // posted, so it runs once the screen is really up
         }
     }
 
-    override fun onPause() {
-        // never keep the mic open in the background
-        setLive(false)
-        abortRecording()
-        tts?.stop()
-        spoken = 0
-        super.onPause()
-    }
-
-    override fun onDestroy() {
-        tts?.shutdown()
-        super.onDestroy()
+    /** The wake word, the widget and the shortcut all land here: open the talk screen already listening. */
+    private fun wake() {
+        if (apiKey().isBlank() || busy || recorder != null || starting) { syncWake(); return }
+        if (tab != 0 || sub) go(0)
+        holdLive = false
+        misses = 0
+        startRecording(false)
     }
 
     // ---------- shell and tabs ----------
@@ -204,31 +278,40 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         items.forEachIndexed { i, item ->
             val col = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_HORIZONTAL
-                minimumHeight = dp(64)
+                gravity = Gravity.CENTER
+                minimumHeight = dp(72)
                 contentDescription = item.third
-                background = ripple(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT), 0)
+                background = ripple(clearBg(), 0)
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { go(i) }
             }
-            // a small gold bar marks the open tab, so the state is not only a color change
-            col.addView(View(this).apply { background = roundBg(C.ACCENT, 2) }, lp(dp(24), dp(3)))
-            col.addView(IconView(this, item.first, C.MUTED), lp(dp(24), dp(24)).apply { topMargin = dp(8) })
+            // the open tab gets a soft pill behind its icon and a heavier label, so the state is not only a color
+            val pill = FrameLayout(this)
+            pill.addView(IconView(this, item.first, C.MUTED), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
+            col.addView(pill, lp(dp(56), dp(32)))
             col.addView(label(item.second, T.META, C.MUTED).apply { gravity = Gravity.CENTER }, lp(-2, -2).apply { topMargin = dp(4) })
             tabBar.addView(col, lp(0, -2, 1f))
         }
         root.addView(tabBar, lp(-1, -2))
         setContentView(root)
+        // with the keyboard up there is no room for everything, so the chat and the text field get the space
+        root.viewTreeObserver.addOnGlobalLayoutListener {
+            val r = Rect()
+            root.getWindowVisibleDisplayFrame(r)
+            val up = root.rootView.height - r.bottom > dp(160)
+            if (up != typing) { typing = up; applyLock(); if (up) scrollDown() }
+        }
     }
 
     // keepScroll is for settings changes, so the page does not jump back to the top
-    fun go(i: Int, keepScroll: Boolean = false) {
-        tab = i
+    fun go(want: Int, keepScroll: Boolean = false) {
+        val i = want
+        tab = if (i != 0 && locked()) 0 else i // over the lock screen only the talk screen exists
         sub = false
         val oldY = (content.getChildAt(0) as? ScrollView)?.scrollY ?: 0
         content.removeAllViews()
-        val v = when (i) {
+        val v = when (tab) {
             0 -> talk
             1 -> Screens(this).practice()
             2 -> Screens(this).progress()
@@ -236,18 +319,21 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
         content.addView(v)
         if (keepScroll && v is ScrollView) v.post { v.scrollTo(0, oldY) }
+        // coming back to the talk screen shows the current state, for example that the wake word is now on
+        if (tab == 0 && recorder == null && !busy && spoken == 0 && !starting) idle()
         for (k in 0 until tabBar.childCount) {
             val col = tabBar.getChildAt(k) as LinearLayout
-            val open = k == i
-            col.getChildAt(0).visibility = if (open) View.VISIBLE else View.INVISIBLE
-            (col.getChildAt(1) as IconView).tint = if (open) C.ACCENT else C.MUTED
-            val name = col.getChildAt(2) as TextView
-            name.setTextColor(if (open) C.ACCENT else C.MUTED)
-            name.typeface = android.graphics.Typeface.create(if (open) "sans-serif-medium" else "sans-serif", android.graphics.Typeface.NORMAL)
+            val open = k == tab
+            val pill = col.getChildAt(0) as FrameLayout
+            pill.background = if (open) roundBg(C.ACCENT_SOFT, 16) else null
+            (pill.getChildAt(0) as IconView).tint = if (open) C.ACCENT else C.MUTED
+            val name = col.getChildAt(1) as TextView
+            name.setTextColor(if (open) C.TEXT else C.MUTED)
+            name.typeface = if (open) T.medium else T.sans
         }
     }
 
-    // a page opened from a tab, like history or memory, back returns to that tab
+    // a page opened from a tab, like history or memory
     fun push(v: View) {
         content.removeAllViews()
         content.addView(v)
@@ -257,121 +343,149 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     fun back() = go(tab)
 
     // ---------- the talk screen ----------
+    // It reads like a script, not a chat app: my lines are small and mint, Jarvis's lines are large serif,
+    // and the voice line under them shows who has the floor.
 
     private fun buildTalk() {
         talk = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(16), dp(16), 0) }
+        val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(24), dp(16), dp(12), 0) }
         val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        titles.addView(label("Jarvis", T.H2, C.TEXT, true))
+        titles.addView(voice("Jarvis", T.H2))
         modeLabel = label("Friend chat", T.META, C.MUTED)
         titles.addView(modeLabel)
         top.addView(titles, lp(0, -2, 1f))
-        val hist = FrameLayout(this).apply {
-            contentDescription = "Chat history"
-            background = ripple(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT), 24)
+        histBtn = FrameLayout(this).apply {
+            contentDescription = "Open chat history"
+            background = ripple(clearBg(), 24)
             isClickable = true
             isFocusable = true
             addView(IconView(this@MainActivity, IconView.Kind.HISTORY, C.TEXT), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
             setOnClickListener { push(Screens(this@MainActivity).history()) }
         }
-        top.addView(hist, lp(dp(48), dp(48)).apply { rightMargin = dp(8) })
-        liveChip = chip("Hands-free off") { setLive(!live) }.apply { contentDescription = "Hands-free mode" }
-        top.addView(liveChip)
+        top.addView(histBtn, lp(dp(48), dp(48)))
         talk.addView(top, lp(-1, -2))
 
-        orb = OrbView(this).apply {
-            contentDescription = "Talk to Jarvis. Double tap to start or stop listening."
-            isClickable = true
-            setOnClickListener { toggleMic() }
-        }
-        talk.addView(orb, lp(-1, dp(176)))
-        status = label("Tap the orb and talk", T.SEC, C.MUTED).apply {
-            gravity = Gravity.CENTER
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        talk.addView(status, lp(-1, -2))
-
-        chatBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
-        // first use: say what this screen is for and give one way in
-        val intro = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL; setPadding(dp(16), dp(24), dp(16), 0) }
-        intro.addView(label("Start a conversation", T.BODY, C.TEXT, true).apply { gravity = Gravity.CENTER })
-        intro.addView(label("Tap the orb and speak, or pick a prompt below.", T.SEC, C.MUTED).apply { gravity = Gravity.CENTER },
-            lp(-1, -2).apply { topMargin = dp(4) })
-        emptyView = intro
+        chatBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(8), dp(24), dp(16)) }
+        emptyView = buildEmpty()
         chatBox.addView(emptyView)
-        chatScroll = ScrollView(this).apply { addView(chatBox); isVerticalScrollBarEnabled = false }
+        chatScroll = ScrollView(this).apply { addView(chatBox); isVerticalScrollBarEnabled = false; isFillViewport = true }
         talk.addView(chatScroll, lp(-1, 0, 1f))
 
         // only visible while I am in a practice scene
-        practiceBar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)); visibility = View.GONE }
+        practiceBar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(8), dp(16), 0); visibility = View.GONE }
         practiceBar.addView(button("Finish and get feedback", 1) { finishPractice() }, lp(0, -2, 1f))
         practiceBar.addView(button("Exit practice") { exitPractice() }, lp(-2, -2).apply { leftMargin = dp(8) })
         talk.addView(practiceBar, lp(-1, -2))
 
-        val prompts = listOf(
-            "Ask about my day" to "Ask me how my day went.",
-            "Tell a story" to "Tell me a short story.",
-            "Get a challenge" to "Give me one small social challenge for today.",
-            "Warm up" to "Help me warm up with a few easy conversation starters.",
-            "Play music" to "Play something relaxing on Spotify."
-        )
-        val chips = LinearLayout(this).apply { setPadding(dp(16), dp(4), dp(16), dp(4)) }
-        for ((name, text) in prompts) chips.addView(chip(name) { if (!busy) send(text, null, null) }, lp(-2, -2).apply { rightMargin = dp(8) })
-        promptRow = HorizontalScrollView(this).apply { addView(chips); isHorizontalScrollBarEnabled = false }
-        talk.addView(promptRow, lp(-1, -2))
+        // the voice line runs edge to edge, the mic sits on it
+        val stage = FrameLayout(this)
+        this.stage = stage
+        line = VoiceLine(this)
+        stage.addView(line, FrameLayout.LayoutParams(-1, -1))
+        micIcon = IconView(this, IconView.Kind.MIC, C.INK)
+        micBtn = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
+            addView(micIcon, FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
+            setOnClickListener { toggleMic() }
+        }
+        stage.addView(micBtn, FrameLayout.LayoutParams(dp(72), dp(72), Gravity.CENTER))
+        talk.addView(stage, lp(-1, dp(104)))
 
-        val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+        status = label("", T.SEC, C.MUTED).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(24), 0, dp(24), 0)
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        talk.addView(status, lp(-1, -2))
+
+        val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(12)) }
         input = EditText(this).apply {
-            hint = "Type a message"
+            hint = "Or type a message"
             textSize = T.BODY
             setHintTextColor(C.MUTED)
             setTextColor(C.TEXT)
             minHeight = dp(48)
-            background = roundBg(C.SURFACE2, 24, C.STROKE)
-            setPadding(dp(16), dp(8), dp(16), dp(8))
+            background = roundBg(C.SURFACE, 24, C.STROKE)
+            setPadding(dp(20), dp(8), dp(20), dp(8))
             imeOptions = EditorInfo.IME_ACTION_SEND
-            inputType = InputType.TYPE_CLASS_TEXT
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             setOnEditorActionListener { _, _, _ -> submit(); true }
         }
         bar.addView(input, lp(0, -2, 1f))
         val sendBtn = FrameLayout(this).apply {
             contentDescription = "Send message"
-            background = ripple(roundBg(C.ACCENT, 24), 24)
+            background = ripple(roundBg(C.SURFACE, 24, C.STROKE), 24)
             isClickable = true
             isFocusable = true
-            addView(IconView(this@MainActivity, IconView.Kind.SEND, C.INK), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
+            addView(IconView(this@MainActivity, IconView.Kind.SEND, C.TEXT), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
             setOnClickListener { submit() }
         }
         bar.addView(sendBtn, lp(dp(48), dp(48)).apply { leftMargin = dp(8) })
         talk.addView(bar, lp(-1, -2))
+
+        // bring back the last lines, so opening the app continues the same conversation
+        val past = Brain.entries(this).filter { !it.practice }.take(10).reversed()
+        for (e in past) bubble(e.mine, e.text, false)
+        if (past.isNotEmpty()) for (k in 0 until chatBox.childCount) chatBox.getChildAt(k).alpha = 0.55f
+        setMic(VoiceLine.S.IDLE)
+    }
+
+    // first use: a greeting and three ways in
+    private fun buildEmpty(): View {
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(24), 0, 0) }
+        val hour = LocalTime.now().hour
+        col.addView(voice(when { hour < 12 -> "Good morning."; hour < 17 -> "Good afternoon."; else -> "Good evening." }, T.H1))
+        col.addView(label("Say anything, or start with one of these.", T.BODY, C.MUTED), lp(-1, -2).apply { topMargin = dp(8) })
+        val list = panel()
+        val prompts = listOf(
+            "Ask about my day" to "Ask me how my day went.",
+            "Tell me a story" to "Tell me a short story.",
+            "Give me one small challenge" to "Give me one small social challenge for today."
+        )
+        prompts.forEachIndexed { i, (name, text) ->
+            if (i > 0) list.addView(hairline(), lp(-1, 1))
+            val row = LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(56)
+                setPadding(dp(16), dp(8), dp(12), dp(8))
+                background = ripple(clearBg(), 0)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { if (!busy) send(text, null, null) }
+            }
+            row.addView(label(name, T.BODY, C.TEXT), lp(0, -2, 1f))
+            row.addView(IconView(this, IconView.Kind.CHEVRON, C.MUTED), lp(dp(24), dp(24)))
+            list.addView(row, lp(-1, -2))
+        }
+        col.addView(list, lp(-1, -2).apply { topMargin = dp(24) })
+        return col
     }
 
     private fun submit() {
         val t = input.text.toString().trim()
         if (t.isEmpty() || busy) return
         input.setText("")
+        abortRecording()
+        stopSpeech()
         send(t, null, null)
     }
 
-    // my words sit in a bubble on the right, Jarvis talks as plain text on the left like a transcript
-    private fun bubble(mine: Boolean, msg: String): TextView {
+    // every new turn pushes the older lines back, so the eye stays on what is being said now
+    private fun bubble(mine: Boolean, msg: String, animate: Boolean = true): TextView {
         emptyView.visibility = View.GONE
-        val tv = label(msg, T.BODY, C.TEXT).apply {
-            maxWidth = (resources.displayMetrics.widthPixels * (if (mine) 0.8f else 0.92f)).toInt()
-            if (mine) {
-                setPadding(dp(16), dp(12), dp(16), dp(12))
-                background = bubbleBg(C.SURFACE2)
-            } else {
-                setPadding(0, dp(4), 0, dp(4))
-            }
-            if (!reduceMotion()) {
-                alpha = 0f
-                translationY = dp(8).toFloat()
-                animate().alpha(1f).translationY(0f).setDuration(200).setInterpolator(DecelerateInterpolator()).start()
-            }
+        if (animate && (mine || !turnOpen)) {
+            for (k in 0 until chatBox.childCount) (chatBox.getChildAt(k) as? TextView)?.alpha = 0.55f
+            turnOpen = true
         }
-        chatBox.addView(tv, lp(-2, -2).apply { gravity = if (mine) Gravity.END else Gravity.START; topMargin = dp(12) })
+        val tv = if (mine) label(msg, T.SEC, C.YOU, true) else voice(msg)
+        if (animate && !reduceMotion()) {
+            tv.alpha = 0f
+            tv.translationY = dp(8).toFloat()
+            tv.animate().alpha(1f).translationY(0f).setDuration(200).setInterpolator(DecelerateInterpolator()).start()
+        }
+        chatBox.addView(tv, lp(-1, -2).apply { topMargin = dp(if (mine) 24 else 8) })
         while (chatBox.childCount > 80) chatBox.removeViewAt(1)
         scrollDown()
         return tv
@@ -391,7 +505,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             Toast.makeText(this, "Details copied", Toast.LENGTH_SHORT).show()
         })
         col.addView(actions, lp(-2, -2).apply { topMargin = dp(12) })
-        chatBox.addView(col, lp(-1, -2).apply { topMargin = dp(12) })
+        chatBox.addView(col, lp(-1, -2).apply { topMargin = dp(24) })
         scrollDown()
     }
 
@@ -407,29 +521,67 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun setStatus(s: String) { status.text = s }
 
-    private fun idle() {
-        orb.state = OrbView.S.IDLE
-        setStatus(if (live) "Hands-free is on, I listen after I speak" else "Tap the orb and talk")
+    // the line and the mic button always change together, and the button says what a tap will do
+    private fun setMic(s: VoiceLine.S) {
+        line.state = s
+        val listening = s == VoiceLine.S.LISTEN
+        val thinking = s == VoiceLine.S.THINK
+        micBtn.background = ripple(roundBg(if (listening) C.YOU else if (thinking) C.SURFACE2 else C.ACCENT, 36, if (thinking) C.STROKE else 0), 36)
+        micIcon.kind = if (listening) IconView.Kind.STOP else IconView.Kind.MIC
+        micIcon.tint = if (thinking) C.MUTED else C.INK
+        micBtn.contentDescription = when (s) {
+            VoiceLine.S.LISTEN -> "Stop listening"
+            VoiceLine.S.THINK -> "Jarvis is thinking"
+            VoiceLine.S.SPEAK -> "Interrupt Jarvis and talk"
+            else -> "Start talking"
+        }
     }
 
-    private fun setLive(on: Boolean) {
-        live = on
-        liveChip.text = if (on) "Hands-free on" else "Hands-free off"
-        styleChip(liveChip, on)
-        if (on && !busy && recorder == null && spoken == 0) startRecording()
+    private fun idle(note: String? = null) {
+        val armed = WakeService.running
+        setMic(if (armed) VoiceLine.S.STANDBY else VoiceLine.S.IDLE)
+        line.level = 0f
+        setStatus(note ?: if (armed) "Say \"${WakeService.phrase(this)}\" or tap the mic" else "Tap the mic and talk")
+        syncWake()
+        applyLock()
+    }
+
+    // the wake word service must stay quiet while I use the mic or Jarvis is talking, or it would hear itself
+    private fun syncWake() {
+        WakeService.hold(resumed && (recorder != null || busy || spoken > 0 || starting))
+    }
+
+    fun continuous() = prefs.getBoolean("cont", true)
+
+    fun setWake(on: Boolean) {
+        if (on && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+            Toast.makeText(this, "Allow the microphone, then turn the wake word on", Toast.LENGTH_LONG).show()
+            ui.post { go(3, true) }
+            return
+        }
+        prefs.edit().putBoolean("wake", on).apply()
+        if (on) WakeService.start(this) else WakeService.stop(this)
+    }
+
+    fun restartWake() {
+        if (!WakeService.running) return
+        WakeService.stop(this)
+        ui.postDelayed({ if (resumed && WakeService.enabled(this)) WakeService.start(this) }, 600)
     }
 
     // ---------- voice out ----------
 
     override fun onInit(code: Int) {
         if (code != TextToSpeech.SUCCESS) return
+        ttsReady = true
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(id: String?) {}
-            override fun onDone(id: String?) { ui.post { spokeOne() } }
-            // every spoken word gives the orb a small beat, Android does not expose the real waveform
-            override fun onRangeStart(id: String?, start: Int, end: Int, frame: Int) { ui.post { orb.pulse() } }
+            override fun onDone(id: String?) { ui.post { spokeOne(id) } }
             @Deprecated("Deprecated in Java")
-            override fun onError(id: String?) { ui.post { spokeOne() } }
+            override fun onError(id: String?) { ui.post { spokeOne(id) } }
+            // every spoken word gives the line a small beat, Android does not expose the real waveform
+            override fun onRangeStart(id: String?, start: Int, end: Int, frame: Int) { ui.post { line.pulse() } }
         })
         applyVoice()
     }
@@ -446,18 +598,32 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     }
 
     private fun speak(text: String) {
+        if (text.isBlank() || !ttsReady || !resumed) return
+        val ok = tts?.speak(text, TextToSpeech.QUEUE_ADD, null, "$gen:" + System.nanoTime())
+        if (ok != TextToSpeech.SUCCESS) return
         spoken++
-        orb.state = OrbView.S.SPEAK
-        setStatus("Speaking")
-        tts?.speak(text, TextToSpeech.QUEUE_ADD, null, "jv" + System.nanoTime())
+        setMic(VoiceLine.S.SPEAK)
+        setStatus("Tap the mic to interrupt")
+        syncWake()
     }
 
-    // one sentence finished, when the queue is empty the orb relaxes and live mode listens again
-    private fun spokeOne() {
+    private fun stopSpeech() {
+        gen++
+        spoken = 0
+        tts?.stop()
+    }
+
+    // one sentence finished, when the queue is empty the turn goes back to me
+    private fun spokeOne(id: String?) {
+        if (id == null || !id.startsWith("$gen:")) return
         spoken = maxOf(0, spoken - 1)
-        if (spoken > 0 || busy) return // while the reply is still streaming the orb keeps its shape
-        idle()
-        if (live && !busy && !holdLive && recorder == null) startRecording()
+        if (spoken > 0 || busy) return // while the reply is still streaming the line keeps its shape
+        afterSpeech()
+    }
+
+    // the continuous flow: Jarvis finished, so listen again without a tap, unless a confirm dialog is open
+    private fun afterSpeech() {
+        if (resumed && voiceTurn && continuous() && !holdLive && !typing && recorder == null && !busy) startRecording(true) else idle()
     }
 
     // ---------- microphone ----------
@@ -466,84 +632,103 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private fun newRecorder() = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
 
     private fun toggleMic() {
-        if (recorder != null) { stopRecording(); return }
+        if (starting) return
+        if (recorder != null) { followUp = false; stopRecording(); return }
         if (busy) return
         holdLive = false
-        startRecording()
+        misses = 0
+        startRecording(false)
     }
 
-    private fun startRecording() {
+    private val beginRun = Runnable { starting = false; begin() }
+
+    private fun startRecording(follow: Boolean) {
+        if (starting || recorder != null) return
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+            idle("Allow the microphone, then tap the mic")
             return
         }
-        tts?.stop()
-        spoken = 0
+        stopSpeech()
+        followUp = follow
+        starting = true
+        syncWake()
+        // the wake word service needs a moment to let go of the microphone
+        if (WakeService.capturing) ui.postDelayed(beginRun, 250) else beginRun.run()
+    }
+
+    private fun begin() {
+        if (!resumed) { syncWake(); return }
         val r = newRecorder()
         try {
-            r.setAudioSource(MediaRecorder.AudioSource.MIC)
+            r.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            r.setAudioChannels(1)
             r.setAudioSamplingRate(16000)
-            r.setAudioEncodingBitRate(32000)
+            r.setAudioEncodingBitRate(64000)
             r.setOutputFile(File(cacheDir, "voice.m4a").absolutePath)
             r.prepare()
             r.start()
         } catch (e: Exception) {
             r.release()
-            setStatus("Could not start the microphone. Close other apps that use it and try again.")
+            idle("Could not start the microphone. Close other apps that use it and try again.")
             return
         }
         recorder = r
         startedAt = System.currentTimeMillis()
         lastVoice = startedAt
         heardVoice = false
-        orb.state = OrbView.S.LISTEN
-        orb.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        floor = 0
+        setMic(VoiceLine.S.LISTEN)
+        if (!followUp) micBtn.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
         setStatus("Listening")
+        syncWake()
         ui.postDelayed(poll, 100)
     }
 
-    // stops by itself once I stop talking, and the orb follows how loud I am
+    // stops by itself once I stop talking, and the line follows how loud I am
     private val poll = object : Runnable {
         override fun run() {
             val r = recorder ?: return
             val amp = try { r.maxAmplitude } catch (e: Exception) { 0 }
             val now = System.currentTimeMillis()
-            orb.level = (amp / 9000f).coerceIn(0f, 1f)
-            if (amp > 1800) { heardVoice = true; lastVoice = now }
-            val quiet = heardVoice && now - lastVoice > 1400
-            if (quiet || now - startedAt > 30000 || (!heardVoice && now - startedAt > 8000)) {
-                stopRecording()
-                return
-            }
+            line.level = (amp / 9000f).coerceIn(0f, 1f)
+            // the first moment tells me how noisy the room is, my voice has to be clearly above that
+            if (now - startedAt < 250) floor = maxOf(floor, amp)
+            val gate = (floor * 2).coerceIn(1500, 3500)
+            if (amp > gate) { heardVoice = true; lastVoice = now }
+            val done = heardVoice && now - lastVoice > 1200
+            val nobody = !heardVoice && now - startedAt > (if (followUp) 6000 else 8000)
+            if (done || nobody || now - startedAt > 45000) { stopRecording(); return }
             ui.postDelayed(this, 100)
         }
     }
 
-    private fun abortRecording() {
-        val r = recorder ?: return
+    private fun release(): Boolean {
+        val r = recorder ?: return false
         recorder = null
         ui.removeCallbacks(poll)
-        try { r.stop() } catch (e: RuntimeException) { /* nothing captured */ }
+        var ok = true
+        try { r.stop() } catch (e: RuntimeException) { ok = false } // stop fails if nothing was captured
         r.release()
-        orb.level = 0f
-        idle()
+        line.level = 0f
+        return ok
+    }
+
+    private fun abortRecording() {
+        if (release()) File(cacheDir, "voice.m4a").delete()
     }
 
     private fun stopRecording() {
-        val r = recorder ?: return
-        recorder = null
-        ui.removeCallbacks(poll)
-        try { r.stop() } catch (e: RuntimeException) { heardVoice = false } // stop fails if nothing was captured
-        r.release()
-        orb.level = 0f
-        if (heardVoice) {
+        if (recorder == null) return
+        val ok = release()
+        if (ok && heardVoice) {
             send("", File(cacheDir, "voice.m4a"), null)
+        } else if (followUp) {
+            idle() // I simply did not answer, that is fine
         } else {
-            setLive(false) // silence ends live mode so it never loops on an empty room
-            idle()
-            setStatus("Did not hear anything. Tap the orb and try again.")
+            idle("I did not hear anything. Tap the mic and try again.")
         }
     }
 
@@ -555,10 +740,10 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private fun feed(tok: String) {
         streamText.append(tok)
         val tv = streamTv
-        if (tv == null) streamTv = bubble(false, streamText.toString()) else { tv.text = streamText; scrollDown() }
+        if (tv == null) streamTv = bubble(false, streamText.toString()) else { tv.text = streamText.toString(); scrollDown() }
         sentence.append(tok)
         val s = sentence.toString()
-        val cut = s.indexOfLast { it == '.' || it == '!' || it == '?' || it == '\n' || it == '\u06D4' }
+        val cut = s.indexOfLast { it == '.' || it == '!' || it == '?' || it == '\n' || it == '۔' }
         if (cut >= 15) {
             speak(s.substring(0, cut + 1).trim())
             sentence.delete(0, cut + 1)
@@ -567,10 +752,13 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     private fun send(text: String, audio: File?, hint: String?) {
         val key = apiKey()
-        if (key.isBlank()) { setStatus("Add your Groq key to start"); go(3); return }
+        if (key.isBlank()) { idle("Add your Groq key in Settings to start"); go(3); return }
         busy = true
-        orb.state = OrbView.S.THINK
+        turnOpen = false
+        voiceTurn = audio != null || hint != null
+        setMic(VoiceLine.S.THINK)
         setStatus("Thinking")
+        syncWake()
         val st = style()
         val md = mode
         streamTv = null
@@ -590,50 +778,53 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             val err = error
             ui.post {
                 busy = false
-                if (r == null) {
-                    setLive(false)
-                    tts?.stop()
-                    spoken = 0
-                    idle()
-                    // typed simple commands still work with no internet
-                    val off = if (text.isNotEmpty()) Actions.offline(text) else null
-                    if (off != null) {
-                        streamTv?.let { chatBox.removeView(it) }
-                        holdLive = true
-                        bubble(false, "I cannot reach Groq, so I did that on the phone.")
-                        Actions.run(this, off) { msg -> bubble(false, msg); speak(msg) }
-                        return@post
-                    }
-                    val half = streamTv
-                    val user = lastUser
-                    if (half != null) chatBox.removeView(half)
-                    val again: (() -> Unit)? = if (text.isNotEmpty() || hint != null) ({
-                        if (user != null) chatBox.removeView(user)
-                        send(text, null, hint)
-                    }) else null
-                    errorRow("Jarvis could not answer",
-                        if (again != null) "Check your connection and your Groq key in Settings, then try again."
-                        else "Check your connection and your Groq key in Settings, then tap the orb and speak again.",
-                        err, again)
-                    return@post
-                }
+                if (r == null) { failed(text, hint, audio != null, err); return@post }
+                misses = 0
                 holdLive = r.actions.length() > 0
                 val tv = streamTv
                 if (tv == null) {
                     if (r.text.isNotBlank()) { bubble(false, r.text); speak(r.text) }
                 } else {
                     if (r.text.isNotBlank()) tv.text = r.text
-                    val rest = sentence.toString().trim()
-                    if (rest.isNotEmpty()) speak(rest)
+                    speak(sentence.toString().trim())
                 }
-                Actions.run(this, r.actions) { msg -> bubble(false, msg); speak(msg) }
-                // nothing left to say, so go back to rest, or listen again in hands-free mode
-                if (spoken == 0 && !holdLive) {
-                    idle()
-                    if (live && recorder == null) startRecording()
-                }
+                runActions(r.actions)
+                if (spoken == 0) afterSpeech()
             }
+            // the memory agent tidies up after the reply is already on screen
+            if (r != null && !md.startsWith("practice:")) try { Brain.compact(this, key) } catch (e: Exception) { /* next turn tries again */ }
         }
+    }
+
+    private fun failed(text: String, hint: String?, spokenTurn: Boolean, err: String) {
+        stopSpeech()
+        streamTv?.let { chatBox.removeView(it) }
+        // Whisper heard only noise. In a flowing conversation I just listen once more instead of showing an error.
+        if (err == Brain.NOTHING) {
+            misses++
+            if (resumed && continuous() && !typing && misses < 2) { setStatus("I did not catch that"); startRecording(true) }
+            else idle("I did not catch that. Tap the mic and say it again.")
+            return
+        }
+        // typed simple commands still work with no internet
+        val off = if (text.isNotEmpty()) Actions.offline(text) else null
+        if (off != null) {
+            holdLive = true
+            idle()
+            bubble(false, "I cannot reach Groq, so I did that on the phone.")
+            runActions(off)
+            return
+        }
+        idle()
+        val user = lastUser
+        val again: (() -> Unit)? = if (text.isNotEmpty() || hint != null) ({
+            if (user != null) chatBox.removeView(user)
+            send(text, null, hint)
+        }) else null
+        errorRow("Jarvis could not answer",
+            if (spokenTurn) "Check your connection and your Groq key in Settings, then tap the mic and say it again."
+            else "Check your connection and your Groq key in Settings, then try again.",
+            err, again)
     }
 
     // ---------- encrypted backup ----------
@@ -705,28 +896,30 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val s = scenario
         modeLabel.text = if (s == null) "Friend chat" else "Practice: ${s.title}"
         practiceBar.visibility = if (s == null) View.GONE else View.VISIBLE
-        promptRow.visibility = if (s == null) View.VISIBLE else View.GONE
     }
 
     fun startPractice(s: Coach.Scenario) {
         if (busy) return
         abortRecording()
-        tts?.stop()
-        spoken = 0
+        stopSpeech()
         mode = "practice:" + s.id
         scenario = s
         Brain.clearPractice(this)
         clearChat()
         applyMode()
         go(0)
-        bubble(false, "${s.title}: ${s.blurb}. Talk like it is real, then tap Finish and get feedback.")
+        turnOpen = true
+        bubble(false, "${s.title}. ${s.blurb}. Talk like it is real, then tap Finish and get feedback.").apply {
+            typeface = T.sans
+            textSize = T.SEC
+            setTextColor(C.MUTED)
+        }
         send("", null, "[Start the scene now with your first line, fully in character.]")
     }
 
     private fun exitPractice() {
         abortRecording()
-        tts?.stop()
-        spoken = 0
+        stopSpeech()
         mode = "friend"
         scenario = null
         Brain.clearPractice(this)
@@ -739,11 +932,11 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val s = scenario ?: return
         if (busy) return
         abortRecording()
-        tts?.stop()
-        spoken = 0
+        stopSpeech()
         busy = true
-        orb.state = OrbView.S.THINK
+        setMic(VoiceLine.S.THINK)
         setStatus("Analysing your session")
+        syncWake()
         val key = apiKey()
         val st = style()
         thread {
@@ -755,12 +948,16 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             ui.post {
                 busy = false
                 idle()
+                if (f == null && err == Brain.TOO_SHORT) {
+                    idle("Say a few more lines first, then finish.")
+                    return@post
+                }
                 if (f == null) {
                     errorRow("Could not analyse this session", "Check your connection, then try again. Your chat is still here.", err) { finishPractice() }
                     return@post
                 }
                 Coach.addSession(this, Coach.Session(System.currentTimeMillis(), s.id, f.clarity, f.curiosity, f.warmth, f.confidence))
-                chatBox.addView(Screens(this).feedbackCard(f, s), lp(-1, -2).apply { topMargin = dp(12) })
+                chatBox.addView(Screens(this).feedbackCard(f, s), lp(-1, -2).apply { topMargin = dp(24) })
                 scrollDown()
                 mode = "friend"
                 scenario = null

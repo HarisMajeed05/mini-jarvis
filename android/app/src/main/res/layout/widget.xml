@@ -20,6 +20,6 @@
         android:layout_height="wrap_content"
         android:layout_marginStart="8dp"
         android:text="@string/widget_label"
-        android:textColor="#E8ECEF"
+        android:textColor="#F1ECE2"
         android:textSize="14sp" />
 </LinearLayout>

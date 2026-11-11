@@ -12,8 +12,8 @@ android {
         minSdk = 26
         // 34 on purpose, 35 forces edge to edge and my plain layout would sit under the status bar
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 6
+        versionName = "1.6"
     }
 
     buildTypes {
@@ -22,6 +22,11 @@ android {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("debug")
         }
+    }
+
+    // Vosk loads its native library from a real file, so the libraries are unpacked at install
+    packaging {
+        jniLibs { useLegacyPackaging = true }
     }
 
     lint {
@@ -37,4 +42,10 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // offline wake word. Vosk is open source and runs fully on the phone, JNA is what it needs to load.
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("com.alphacephei:vosk-android:0.3.47@aar")
 }

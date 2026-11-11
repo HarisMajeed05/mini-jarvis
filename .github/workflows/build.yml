@@ -25,6 +25,18 @@ jobs:
         with:
           gradle-version: 8.10.2
 
+      # the small offline model for the wake word goes inside the APK, so the phone never downloads anything
+      # If the download fails the APK is still built, only without the wake word.
+      - name: Add the wake word model
+        continue-on-error: true
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 -o model.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          sha256sum model.zip
+          unzip -q model.zip
+          test -f vosk-model-small-en-us-0.15/am/final.mdl
+          mkdir -p android/app/src/main/assets
+          mv vosk-model-small-en-us-0.15 android/app/src/main/assets/model
+
       - run: gradle -p android :app:assembleRelease --no-daemon
 
       - uses: actions/upload-artifact@v4

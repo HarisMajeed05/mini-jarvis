@@ -18,11 +18,11 @@ object Backup {
     private const val MAGIC = "JVB1"
     private const val MAX = 4 * 1024 * 1024
     private val ALLOWED = mapOf(
-        "brain" to setOf("history", "practice", "memory", "log", "plan", "pmetrics"),
+        "brain" to setOf("history", "practice", "memory", "log", "plan", "pmetrics", "summary", "pending"),
         "coach" to setOf("sessions", "real"),
         "reminders" to setOf("list"),
         "checkin" to setOf("on", "h", "m"),
-        "jarvis" to setOf("confirm", "l2", "style", "theme", "onboarded")
+        "jarvis" to setOf("confirm", "l2", "style", "theme", "onboarded", "cont", "lock", "speech", "stt", "wake_phrase")
     )
 
     private fun key(pass: CharArray, salt: ByteArray): SecretKeySpec {
@@ -66,9 +66,10 @@ object Backup {
             for (k in keys) if (o.has(k)) {
                 val v = o.get(k)
                 val ok = when (k) {
-                    "on", "confirm", "l2", "onboarded" -> v is Boolean
+                    "on", "confirm", "l2", "onboarded", "cont", "lock" -> v is Boolean
                     "h", "m" -> v is Int
-                    "style", "theme" -> v is String && v.length < 12
+                    "style", "theme", "speech", "stt", "wake_phrase" -> v is String && v.length < 16
+                    "summary" -> v is String && v.length < 4000
                     else -> v is String && v.length < MAX && (try { if (k == "plan") JSONObject(v) else JSONArray(v); true } catch (e: Exception) { false })
                 }
                 if (!ok) throw Exception("The backup has a value I do not recognise")
