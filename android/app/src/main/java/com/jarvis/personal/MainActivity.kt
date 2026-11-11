@@ -10,7 +10,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -23,7 +25,6 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.View
-import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -57,6 +58,10 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var micBtn: FrameLayout
     private lateinit var micIcon: IconView
     private lateinit var status: TextView
+    private lateinit var floorBg: GradientDrawable
+    private var floorColor = 0
+    private lateinit var who: TextView     // the big word on the floor: who has it right now
+    private lateinit var sendIcon: IconView
     private lateinit var modeLabel: TextView
     private lateinit var histBtn: View
     private lateinit var chatBox: LinearLayout
@@ -103,6 +108,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
         C.apply(this)
+        T.init(this)
         setTheme(if (C.light) android.R.style.Theme_DeviceDefault_Light_NoActionBar else android.R.style.Theme_DeviceDefault_NoActionBar)
         overLock(intent)
         paintBars()
@@ -190,7 +196,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     @Suppress("DEPRECATION")
     private fun paintBars() {
         window.statusBarColor = C.BG
-        window.navigationBarColor = C.SURFACE
+        window.navigationBarColor = C.BG
         // dark icons on the light theme, light icons on the dark one
         val bits = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         val f = window.decorView.systemUiVisibility
@@ -222,7 +228,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         if (l && (tab != 0 || sub)) go(0)
         tabBar.visibility = if (l || typing || (!prefs.getBoolean("onboarded", false) && apiKey().isBlank())) View.GONE else View.VISIBLE
         stage.visibility = if (typing) View.GONE else View.VISIBLE
-        status.visibility = if (typing) View.GONE else View.VISIBLE
+        status.visibility = if (typing || status.text.isEmpty()) View.GONE else View.VISIBLE
         histBtn.visibility = if (l) View.INVISIBLE else View.VISIBLE
     }
 
@@ -266,31 +272,22 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(C.BG) }
         content = FrameLayout(this)
         root.addView(content, lp(-1, 0, 1f))
-        root.addView(hairline(), lp(-1, 1))
 
-        tabBar = LinearLayout(this).apply { setBackgroundColor(C.SURFACE) }
-        val items = listOf(
-            Triple(IconView.Kind.MIC, "Talk", "Talk to Jarvis"),
-            Triple(IconView.Kind.PRACTICE, "Practice", "Practice conversations"),
-            Triple(IconView.Kind.PROGRESS, "Progress", "Your progress"),
-            Triple(IconView.Kind.SETTINGS, "Settings", "Settings")
-        )
-        items.forEachIndexed { i, item ->
+        // the tabs are just words, the open one is bold with a saffron bar over it
+        tabBar = LinearLayout(this).apply { setBackgroundColor(C.BG); setPadding(dp(12), 0, dp(12), 0) }
+        listOf("Talk", "Practice", "Progress", "Settings").forEachIndexed { i, name ->
             val col = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                minimumHeight = dp(72)
-                contentDescription = item.third
-                background = ripple(clearBg(), 0)
+                gravity = Gravity.CENTER_HORIZONTAL
+                minimumHeight = dp(60)
+                contentDescription = name
+                background = ripple(clearBg(), 12)
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { go(i) }
             }
-            // the open tab gets a soft pill behind its icon and a heavier label, so the state is not only a color
-            val pill = FrameLayout(this)
-            pill.addView(IconView(this, item.first, C.MUTED), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
-            col.addView(pill, lp(dp(56), dp(32)))
-            col.addView(label(item.second, T.META, C.MUTED).apply { gravity = Gravity.CENTER }, lp(-2, -2).apply { topMargin = dp(4) })
+            col.addView(View(this), lp(dp(28), dp(3)))
+            col.addView(label(name, T.SEC, C.MUTED).apply { gravity = Gravity.CENTER }, lp(-2, -2).apply { topMargin = dp(14) })
             tabBar.addView(col, lp(0, -2, 1f))
         }
         root.addView(tabBar, lp(-1, -2))
@@ -324,12 +321,11 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         for (k in 0 until tabBar.childCount) {
             val col = tabBar.getChildAt(k) as LinearLayout
             val open = k == tab
-            val pill = col.getChildAt(0) as FrameLayout
-            pill.background = if (open) roundBg(C.ACCENT_SOFT, 16) else null
-            (pill.getChildAt(0) as IconView).tint = if (open) C.ACCENT else C.MUTED
+            col.getChildAt(0).background = if (open) roundBg(C.YOU, 2) else null
             val name = col.getChildAt(1) as TextView
             name.setTextColor(if (open) C.TEXT else C.MUTED)
-            name.typeface = if (open) T.medium else T.sans
+            name.typeface = if (open) T.strong else T.text
+            col.isSelected = open
         }
     }
 
@@ -343,15 +339,16 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     fun back() = go(tab)
 
     // ---------- the talk screen ----------
-    // It reads like a script, not a chat app: my lines are small and mint, Jarvis's lines are large serif,
-    // and the voice line under them shows who has the floor.
+    // It reads like a script, not a chat app: my lines are small and saffron, Jarvis's lines are large.
+    // Under them is the floor, a block whose color says who has it, readable from across the room:
+    // quiet night while resting, saffron while I talk, the inverse field while Jarvis talks.
 
     private fun buildTalk() {
         talk = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(24), dp(16), dp(12), 0) }
         val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        titles.addView(voice("Jarvis", T.H2))
+        titles.addView(heading("Jarvis", T.H3))
         modeLabel = label("Friend chat", T.META, C.MUTED)
         titles.addView(modeLabel)
         top.addView(titles, lp(0, -2, 1f))
@@ -373,57 +370,67 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         talk.addView(chatScroll, lp(-1, 0, 1f))
 
         // only visible while I am in a practice scene
-        practiceBar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(8), dp(16), 0); visibility = View.GONE }
-        practiceBar.addView(button("Finish and get feedback", 1) { finishPractice() }, lp(0, -2, 1f))
+        practiceBar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(24), dp(8), dp(24), dp(12)); visibility = View.GONE }
+        practiceBar.addView(button("Get feedback", 1) { finishPractice() }, lp(0, -2, 1f))
         practiceBar.addView(button("Exit practice") { exitPractice() }, lp(-2, -2).apply { leftMargin = dp(8) })
         talk.addView(practiceBar, lp(-1, -2))
 
-        // the voice line runs edge to edge, the mic sits on it
-        val stage = FrameLayout(this)
+        // the floor: who has it, the voice line, a status line, and the text field at the bottom
+        floorBg = GradientDrawable().apply {
+            val r = dp(32).toFloat()
+            cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        }
+        val floor = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = floorBg
+            setPadding(dp(24), dp(16), dp(16), dp(10))
+        }
+        val stage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         this.stage = stage
-        line = VoiceLine(this)
-        stage.addView(line, FrameLayout.LayoutParams(-1, -1))
-        micIcon = IconView(this, IconView.Kind.MIC, C.INK)
+        val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        who = heading("", T.H2).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
+        head.addView(who, lp(0, -2, 1f))
+        // the mic sits on the right, where my thumb already is
+        micIcon = IconView(this, IconView.Kind.MIC, C.ON_SAFFRON)
         micBtn = FrameLayout(this).apply {
             isClickable = true
             isFocusable = true
             addView(micIcon, FrameLayout.LayoutParams(dp(28), dp(28), Gravity.CENTER))
             setOnClickListener { toggleMic() }
         }
-        stage.addView(micBtn, FrameLayout.LayoutParams(dp(72), dp(72), Gravity.CENTER))
-        talk.addView(stage, lp(-1, dp(104)))
+        head.addView(micBtn, lp(dp(64), dp(64)))
+        stage.addView(head, lp(-1, -2))
+        line = VoiceLine(this)
+        stage.addView(line, lp(-1, dp(52)).apply { topMargin = dp(2); rightMargin = dp(8) })
+        floor.addView(stage, lp(-1, -2))
 
-        status = label("", T.SEC, C.MUTED).apply {
-            gravity = Gravity.CENTER
-            setPadding(dp(24), 0, dp(24), 0)
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        talk.addView(status, lp(-1, -2))
+        status = label("", T.SEC, C.MUTED).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
+        floor.addView(status, lp(-1, -2).apply { topMargin = dp(4); rightMargin = dp(8) })
 
-        val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(12), dp(16), dp(12)) }
+        val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         input = EditText(this).apply {
             hint = "Or type a message"
             textSize = T.BODY
-            setHintTextColor(C.MUTED)
-            setTextColor(C.TEXT)
-            minHeight = dp(48)
-            background = roundBg(C.SURFACE, 24, C.STROKE)
-            setPadding(dp(20), dp(8), dp(20), dp(8))
+            typeface = T.text
+            minHeight = dp(52)
+            setPadding(dp(18), dp(8), dp(18), dp(8))
             imeOptions = EditorInfo.IME_ACTION_SEND
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             setOnEditorActionListener { _, _, _ -> submit(); true }
         }
         bar.addView(input, lp(0, -2, 1f))
+        sendIcon = IconView(this, IconView.Kind.SEND, C.TEXT)
         val sendBtn = FrameLayout(this).apply {
             contentDescription = "Send message"
-            background = ripple(roundBg(C.SURFACE, 24, C.STROKE), 24)
+            background = ripple(clearBg(), 26)
             isClickable = true
             isFocusable = true
-            addView(IconView(this@MainActivity, IconView.Kind.SEND, C.TEXT), FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
+            addView(sendIcon, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
             setOnClickListener { submit() }
         }
-        bar.addView(sendBtn, lp(dp(48), dp(48)).apply { leftMargin = dp(8) })
-        talk.addView(bar, lp(-1, -2))
+        bar.addView(sendBtn, lp(dp(52), dp(52)).apply { leftMargin = dp(4) })
+        floor.addView(bar, lp(-1, -2).apply { topMargin = dp(8) })
+        talk.addView(floor, lp(-1, -2))
 
         // bring back the last lines, so opening the app continues the same conversation
         val past = Brain.entries(this).filter { !it.practice }.take(10).reversed()
@@ -434,32 +441,30 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
     // first use: a greeting and three ways in
     private fun buildEmpty(): View {
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(24), 0, 0) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(32), 0, 0) }
         val hour = LocalTime.now().hour
-        col.addView(voice(when { hour < 12 -> "Good morning."; hour < 17 -> "Good afternoon."; else -> "Good evening." }, T.H1))
-        col.addView(label("Say anything, or start with one of these.", T.BODY, C.MUTED), lp(-1, -2).apply { topMargin = dp(8) })
-        val list = panel()
+        col.addView(heading(when { hour < 12 -> "Good\nmorning."; hour < 17 -> "Good\nafternoon."; else -> "Good\nevening." }, 48f))
+        col.addView(label("Say anything, or start with one of these.", T.BODY, C.MUTED), lp(-1, -2).apply { topMargin = dp(12) })
+        val list = rows()
         val prompts = listOf(
             "Ask about my day" to "Ask me how my day went.",
             "Tell me a story" to "Tell me a short story.",
             "Give me one small challenge" to "Give me one small social challenge for today."
         )
-        prompts.forEachIndexed { i, (name, text) ->
-            if (i > 0) list.addView(hairline(), lp(-1, 1))
+        for ((name, text) in prompts) {
             val row = LinearLayout(this).apply {
                 gravity = Gravity.CENTER_VERTICAL
-                minimumHeight = dp(56)
-                setPadding(dp(16), dp(8), dp(12), dp(8))
+                minimumHeight = dp(60)
                 background = ripple(clearBg(), 0)
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { if (!busy) send(text, null, null) }
             }
-            row.addView(label(name, T.BODY, C.TEXT), lp(0, -2, 1f))
-            row.addView(IconView(this, IconView.Kind.CHEVRON, C.MUTED), lp(dp(24), dp(24)))
-            list.addView(row, lp(-1, -2))
+            row.addView(voice(name, T.H3), lp(0, -2, 1f))
+            row.addView(IconView(this, IconView.Kind.CHEVRON, C.YOU), lp(dp(24), dp(24)))
+            list.item(row)
         }
-        col.addView(list, lp(-1, -2).apply { topMargin = dp(24) })
+        col.addView(list, lp(-1, -2).apply { topMargin = dp(28) })
         return col
     }
 
@@ -479,13 +484,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             for (k in 0 until chatBox.childCount) (chatBox.getChildAt(k) as? TextView)?.alpha = 0.55f
             turnOpen = true
         }
-        val tv = if (mine) label(msg, T.SEC, C.YOU, true) else voice(msg)
-        if (animate && !reduceMotion()) {
-            tv.alpha = 0f
-            tv.translationY = dp(8).toFloat()
-            tv.animate().alpha(1f).translationY(0f).setDuration(200).setInterpolator(DecelerateInterpolator()).start()
-        }
-        chatBox.addView(tv, lp(-1, -2).apply { topMargin = dp(if (mine) 24 else 8) })
+        val tv = if (mine) label(msg, T.BODY, C.YOU, true) else voice(msg)
+        chatBox.addView(tv, lp(-1, -2).apply { topMargin = dp(if (mine) 28 else 10) })
         while (chatBox.childCount > 80) chatBox.removeViewAt(1)
         scrollDown()
         return tv
@@ -519,16 +519,42 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         emptyView.visibility = View.VISIBLE
     }
 
-    private fun setStatus(s: String) { status.text = s }
+    // an empty status takes no room on the floor
+    private fun setStatus(s: String) {
+        status.text = s
+        status.visibility = if (typing || s.isEmpty()) View.GONE else View.VISIBLE
+    }
 
     // the line and the mic button always change together, and the button says what a tap will do
     private fun setMic(s: VoiceLine.S) {
         line.state = s
         val listening = s == VoiceLine.S.LISTEN
         val thinking = s == VoiceLine.S.THINK
-        micBtn.background = ripple(roundBg(if (listening) C.YOU else if (thinking) C.SURFACE2 else C.ACCENT, 36, if (thinking) C.STROKE else 0), 36)
+        val speaking = s == VoiceLine.S.SPEAK
+        // the field and its ink: saffron is me, the inverse is Jarvis, raised night is nobody
+        val field = when { listening -> C.SAFFRON; speaking -> C.INVERSE; else -> C.RAISED }
+        val ink = when { listening -> C.ON_SAFFRON; speaking -> C.ON_INVERSE; else -> C.TEXT }
+        fade(floorBg, if (floorColor == 0) field else floorColor, field)
+        floorColor = field
+        who.text = when (s) {
+            VoiceLine.S.LISTEN -> "Listening"
+            VoiceLine.S.THINK -> "Thinking"
+            VoiceLine.S.SPEAK -> "Jarvis"
+            else -> "Your turn"
+        }
+        who.setTextColor(ink)
+        status.setTextColor(ink)
+        status.alpha = 0.72f
+        line.ink = if (listening || speaking) ink else C.MUTED
+        input.setTextColor(ink)
+        input.setHintTextColor(Color.argb(170, Color.red(ink), Color.green(ink), Color.blue(ink)))
+        input.background = roundBg(Color.argb(if (C.light && !speaking) 14 else 26, Color.red(ink), Color.green(ink), Color.blue(ink)), 16)
+        sendIcon.tint = ink
+        // the mic is the one saffron thing at rest, on a colored field it turns to that field's ink
+        val micFill = when { listening || speaking -> ink; thinking -> Color.TRANSPARENT; else -> C.SAFFRON }
+        micBtn.background = ripple(roundBg(micFill, 36, if (thinking) C.MUTED else 0), 36, !listening && !speaking)
         micIcon.kind = if (listening) IconView.Kind.STOP else IconView.Kind.MIC
-        micIcon.tint = if (thinking) C.MUTED else C.INK
+        micIcon.tint = when { listening || speaking -> field; thinking -> C.MUTED; else -> C.ON_SAFFRON }
         micBtn.contentDescription = when (s) {
             VoiceLine.S.LISTEN -> "Stop listening"
             VoiceLine.S.THINK -> "Jarvis is thinking"
@@ -682,7 +708,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         floor = 0
         setMic(VoiceLine.S.LISTEN)
         if (!followUp) micBtn.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        setStatus("Listening")
+        setStatus("I stop listening when you pause")
         syncWake()
         ui.postDelayed(poll, 100)
     }
@@ -757,7 +783,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         turnOpen = false
         voiceTurn = audio != null || hint != null
         setMic(VoiceLine.S.THINK)
-        setStatus("Thinking")
+        setStatus("")
         syncWake()
         val st = style()
         val md = mode
@@ -909,8 +935,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         applyMode()
         go(0)
         turnOpen = true
-        bubble(false, "${s.title}. ${s.blurb}. Talk like it is real, then tap Finish and get feedback.").apply {
-            typeface = T.sans
+        bubble(false, "${s.title}. ${s.blurb}. Talk like it is real, then tap Get feedback.").apply {
+            typeface = T.text
             textSize = T.SEC
             setTextColor(C.MUTED)
         }

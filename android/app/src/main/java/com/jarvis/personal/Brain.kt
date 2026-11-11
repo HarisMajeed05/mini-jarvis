@@ -1,56 +1,15 @@
 package com.jarvis.personal
 
 import android.content.Context
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
-import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
-import java.security.KeyStore
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-import javax.crypto.Cipher
-import javax.crypto.KeyGenerator
-import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
-
-// My Groq key never lives in the APK or on GitHub. I type it once in Settings and it is
-// stored encrypted with a key that stays inside the phone's Keystore.
-object Secret {
-    private const val ALIAS = "jarvis_groq"
-
-    private fun key(): SecretKey {
-        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
-        val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
-        gen.init(
-            KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .build()
-        )
-        return gen.generateKey()
-    }
-
-    fun seal(plain: String): String {
-        val c = Cipher.getInstance("AES/GCM/NoPadding")
-        c.init(Cipher.ENCRYPT_MODE, key())
-        return Base64.encodeToString(c.iv + c.doFinal(plain.toByteArray()), Base64.NO_WRAP)
-    }
-
-    fun open(sealed: String): String {
-        if (sealed.isEmpty()) return ""
-        val raw = Base64.decode(sealed, Base64.NO_WRAP)
-        val c = Cipher.getInstance("AES/GCM/NoPadding")
-        c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, raw, 0, 12))
-        return String(c.doFinal(raw, 12, raw.size - 12))
-    }
-}
 
 // The whole brain runs on the phone: speech to text, the chat model, my tools, memory.
 // The model never writes URLs or numbers, it only picks a tool and plain arguments.
@@ -331,7 +290,9 @@ object Brain {
         }
         val keptMem = JSONArray()
         for (i in maxOf(0, mem.length() - 80) until mem.length()) keptMem.put(mem.getString(i))
-        prefs(c).edit().putString("summary", clean(o.optString("summary"), 1200))
+        // a reply without a summary must not wipe the one I already have
+        val summary = clean(o.optString("summary"), 1200).ifBlank { prefs(c).getString("summary", "") ?: "" }
+        prefs(c).edit().putString("summary", summary)
             .putString("memory", keptMem.toString()).remove("pending").apply()
     }
 
