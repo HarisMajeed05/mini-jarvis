@@ -4,6 +4,3 @@ android/app/build/
 android/local.properties
 *.apk
 android/app/src/main/assets/model/
-.idea/
-*.iml
-android/.kotlin/

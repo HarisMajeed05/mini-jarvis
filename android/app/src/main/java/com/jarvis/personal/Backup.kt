@@ -22,7 +22,7 @@ object Backup {
         "coach" to setOf("sessions", "real"),
         "reminders" to setOf("list"),
         "checkin" to setOf("on", "h", "m"),
-        "jarvis" to setOf("confirm", "l2", "style", "theme", "onboarded", "cont", "lock", "speech", "stt", "wake_phrase")
+        "jarvis" to setOf("confirm", "l2", "style", "theme", "onboarded", "cont", "lock", "speech", "stt", "wake_phrase", "model")
     )
 
     private fun key(pass: CharArray, salt: ByteArray): SecretKeySpec {
@@ -69,6 +69,7 @@ object Backup {
                     "on", "confirm", "l2", "onboarded", "cont", "lock" -> v is Boolean
                     "h", "m" -> v is Int
                     "style", "theme", "speech", "stt", "wake_phrase" -> v is String && v.length < 16
+                    "model" -> v is String && v.length < 81
                     "summary" -> v is String && v.length < 4000
                     else -> v is String && v.length < MAX && (try { if (k == "plan") JSONObject(v) else JSONArray(v); true } catch (e: Exception) { false })
                 }

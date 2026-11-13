@@ -1,22 +1,93 @@
 package com.jarvis.personal
 
 import android.content.Context
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.KeyStore
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+
+// My Groq key never lives in the APK or on GitHub. I type it once in Settings and it is
+// stored encrypted with a key that stays inside the phone's Keystore.
+object Secret {
+    private const val ALIAS = "jarvis_groq"
+
+    private fun key(): SecretKey {
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (ks.getKey(ALIAS, null) as? SecretKey)?.let { return it }
+        val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        gen.init(
+            KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build()
+        )
+        return gen.generateKey()
+    }
+
+    fun seal(plain: String): String {
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.ENCRYPT_MODE, key())
+        return Base64.encodeToString(c.iv + c.doFinal(plain.toByteArray()), Base64.NO_WRAP)
+    }
+
+    fun open(sealed: String): String {
+        if (sealed.isEmpty()) return ""
+        val raw = Base64.decode(sealed, Base64.NO_WRAP)
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, raw, 0, 12))
+        return String(c.doFinal(raw, 12, raw.size - 12))
+    }
+}
 
 // The whole brain runs on the phone: speech to text, the chat model, my tools, memory.
 // The model never writes URLs or numbers, it only picks a tool and plain arguments.
 object Brain {
     private const val NAME = "Haris"
     private const val API = "https://api.groq.com/openai/v1"
-    private const val CHAT = "openai/gpt-oss-120b"
+    // gpt-oss thinks before it answers. Low effort keeps the voice chat quick, the thinking itself stays hidden,
+    // and the token limits below leave room for it because thinking and answer share one budget.
+    const val DEFAULT_MODEL = "openai/gpt-oss-120b"
+
+    /** The chat model. I can pick another one in Settings from the list Groq sends, so a retired model never breaks the app. */
+    fun model(c: Context): String {
+        val m = c.getSharedPreferences("jarvis", Context.MODE_PRIVATE).getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL
+        return if (Regex("[A-Za-z0-9._/-]{3,80}").matches(m)) m else DEFAULT_MODEL
+    }
+
+    // Thinking and answer share one token budget, so the limits below leave room for both.
+    // Only the gpt-oss models take these two settings, other models get a plain request.
+    private fun body(c: Context, effort: String): JSONObject {
+        val m = model(c)
+        val b = JSONObject().put("model", m)
+        if (m.startsWith("openai/gpt-oss")) b.put("reasoning_effort", effort).put("include_reasoning", false)
+        return b
+    }
+
+    /** Asks Groq which chat models my key can use right now. */
+    fun models(key: String): List<String> {
+        val con = URL("$API/models").openConnection() as HttpURLConnection
+        con.connectTimeout = 15000
+        con.readTimeout = 20000
+        con.setRequestProperty("Authorization", "Bearer $key")
+        con.setRequestProperty("User-Agent", "jarvis-android/1.0")
+        val data = JSONObject(finish(con)).getJSONArray("data")
+        val skip = listOf("whisper", "guard", "orpheus", "tts", "compound")
+        return (0 until data.length()).map { data.getJSONObject(it).optString("id") }
+            .filter { id -> Regex("[A-Za-z0-9._/-]{3,80}").matches(id) && skip.none { id.contains(it) } }.sorted()
+    }
     private const val STT_FAST = "whisper-large-v3-turbo"
     private const val STT_BEST = "whisper-large-v3"
     private const val KEEP = 30 // messages the model sees word for word, older ones live on in the summary
@@ -147,6 +218,7 @@ object Brain {
             throw Exception("Groq ${con.responseCode} $e")
         }
         val text = StringBuilder()
+        val raw = StringBuilder()
         val ids = sortedMapOf<Int, String>()
         val names = HashMap<Int, String>()
         val args = HashMap<Int, StringBuilder>()
@@ -157,7 +229,21 @@ object Brain {
                 if (d == "[DONE]") break
                 val delta = (try { JSONObject(d).optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta") } catch (e: Exception) { null }) ?: continue
                 val tok = delta.optString("content", "")
-                if (tok.isNotEmpty() && !delta.isNull("content")) { text.append(tok); onToken?.invoke(tok) }
+                if (tok.isNotEmpty() && !delta.isNull("content")) {
+                    // some models write their thinking inside <think> tags, that part must not be shown or spoken
+                    raw.append(tok)
+                    val open = raw.lastIndexOf("<think>")
+                    val inside = open >= 0 && raw.indexOf("</think>", open) < 0
+                    val maybe = !inside && raw.length < 7 && "<think>".startsWith(raw.toString().trimStart())
+                    if (!inside && !maybe) {
+                        val clean = raw.toString().replace(Regex("(?s)<think>.*?</think>"), "").trimStart()
+                        if (clean.length > text.length) {
+                            val add = clean.substring(text.length)
+                            text.append(add)
+                            onToken?.invoke(add)
+                        }
+                    }
+                }
                 val tc = delta.optJSONArray("tool_calls") ?: continue
                 for (i in 0 until tc.length()) {
                     val t = tc.getJSONObject(i)
@@ -188,8 +274,8 @@ object Brain {
         return JSONObject(finish(con)).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
     }
 
-    private fun turn(key: String, messages: JSONArray, withTools: Boolean, onToken: ((String) -> Unit)?): JSONObject {
-        val body = JSONObject().put("model", CHAT).put("messages", messages).put("temperature", 0.6).put("max_tokens", 400)
+    private fun turn(c: Context, key: String, messages: JSONArray, withTools: Boolean, onToken: ((String) -> Unit)?): JSONObject {
+        val body = body(c, "medium").put("messages", messages).put("temperature", 0.6).put("max_completion_tokens", 2500)
         if (withTools) body.put("tools", TOOLS).put("tool_choice", "auto")
         return stream(key, body, onToken)
     }
@@ -223,7 +309,7 @@ object Brain {
         val actions = JSONArray()
         var reply = "Sorry, I got stuck. Please try again."
         for (round in 0 until 3) {
-            val m = turn(key, msgs, !practice, onToken)
+            val m = turn(c, key, msgs, !practice, onToken)
             val calls = m.optJSONArray("tool_calls")
             val content = m.optString("content", "")
             if (calls == null || calls.length() == 0) { reply = content.trim(); break }
@@ -242,18 +328,15 @@ object Brain {
         val h = arr(c, histKey)
         if (heard.isNotEmpty()) h.put(JSONObject().put("role", "user").put("content", heard))
         h.put(JSONObject().put("role", "assistant").put("content", reply))
-        var from = 0
-        if (h.length() > KEEP + 10) {
-            from = h.length() - KEEP
-            if (!practice) {
-                val old = JSONArray()
-                for (i in 0 until from) old.put(h.getJSONObject(i))
-                val pend = arr(c, "pending")
-                for (i in 0 until old.length()) pend.put(old.getJSONObject(i))
-                val cap = JSONArray()
-                for (i in maxOf(0, pend.length() - 60) until pend.length()) cap.put(pend.getJSONObject(i))
-                prefs(c).edit().putString("pending", cap.toString()).apply()
-            }
+        val from = if (h.length() > KEEP + 10) h.length() - KEEP else 0
+        // every friend chat turn also goes to the memory agent's tray, it reads the tray every few turns
+        if (!practice) {
+            val pend = arr(c, "pending")
+            if (heard.isNotEmpty()) pend.put(JSONObject().put("role", "user").put("content", heard))
+            pend.put(JSONObject().put("role", "assistant").put("content", reply))
+            val cap = JSONArray()
+            for (i in maxOf(0, pend.length() - 60) until pend.length()) cap.put(pend.getJSONObject(i))
+            prefs(c).edit().putString("pending", cap.toString()).apply()
         }
         val kept = JSONArray()
         for (i in from until h.length()) kept.put(h.getJSONObject(i))
@@ -269,18 +352,18 @@ object Brain {
      */
     fun compact(c: Context, key: String) {
         val pend = arr(c, "pending")
-        if (pend.length() == 0) return
+        if (pend.length() < 8) return // about four exchanges, so a short chat is already remembered next time
         val sb = StringBuilder()
         for (i in 0 until pend.length()) {
             val m = pend.getJSONObject(i)
             sb.append(if (m.getString("role") == "user") "$NAME: " else "Jarvis: ").append(m.getString("content")).append('\n')
         }
-        val sys = "You are the memory agent of a voice companion. You get the summary so far and older chat lines. " +
+        val sys = "You are the memory agent of a voice companion. You get the summary so far and the newest chat lines. " +
             "Return JSON only: summary (the updated summary of everything so far, at most 120 words, plain sentences, " +
             "keep names, plans, feelings and open threads) and facts (array of 0 to 4 short lasting facts about $NAME " +
             "that were stated in these lines, such as people, routines, likes, goals. No guesses, nothing about health, " +
             "money, religion or politics)."
-        val o = json(key, sys, "Summary so far: ${prefs(c).getString("summary", "") ?: ""}\n\nOlder lines:\n$sb")
+        val o = json(c, key, sys, "Summary so far: ${prefs(c).getString("summary", "") ?: ""}\n\nNewest lines:\n$sb")
         val mem = arr(c, "memory")
         val known = (0 until mem.length()).map { mem.getString(it).lowercase() }.toSet()
         val facts = o.optJSONArray("facts")
@@ -290,9 +373,7 @@ object Brain {
         }
         val keptMem = JSONArray()
         for (i in maxOf(0, mem.length() - 80) until mem.length()) keptMem.put(mem.getString(i))
-        // a reply without a summary must not wipe the one I already have
-        val summary = clean(o.optString("summary"), 1200).ifBlank { prefs(c).getString("summary", "") ?: "" }
-        prefs(c).edit().putString("summary", summary)
+        prefs(c).edit().putString("summary", clean(o.optString("summary"), 1200))
             .putString("memory", keptMem.toString()).remove("pending").apply()
     }
 
@@ -352,7 +433,7 @@ object Brain {
             "curiosity (asked questions, showed interest), warmth, confidence. Also: wins (array of 2 short strings), " +
             "improve (array of 2 short specific tips) and better (one of the User's lines rewritten better, as a string). " +
             "Do not inflate scores. Write the text in ${STYLES[style]}."
-        val body = JSONObject().put("model", CHAT).put("temperature", 0.3).put("max_tokens", 500)
+        val body = body(c, "low").put("temperature", 0.3).put("max_completion_tokens", 1500)
             .put("response_format", JSONObject().put("type", "json_object"))
             .put("messages", JSONArray()
                 .put(JSONObject().put("role", "system").put("content", sys))
@@ -375,8 +456,8 @@ object Brain {
         return Plan(o.optString("week"), o.optString("focus"), (0 until d.length()).map { d.optString(it) }, o.optString("why"))
     }
 
-    private fun json(key: String, sys: String, user: String): JSONObject {
-        val body = JSONObject().put("model", CHAT).put("temperature", 0.4).put("max_tokens", 700)
+    private fun json(c: Context, key: String, sys: String, user: String): JSONObject {
+        val body = body(c, "low").put("temperature", 0.4).put("max_completion_tokens", 2000)
             .put("response_format", JSONObject().put("type", "json_object"))
             .put("messages", JSONArray()
                 .put(JSONObject().put("role", "system").put("content", sys))
@@ -399,11 +480,11 @@ object Brain {
             "(Monday to Sunday) with ONE small doable step per day, mixing short practice sessions and tiny real life steps, " +
             "never overwhelming, one rest day. Return JSON only: focus (the one skill to work on, short), days (array of 7 short strings), " +
             "why (one sentence). Write in $lang."
-        val draft = json(key, planner, facts.toString())
+        val draft = json(c, key, planner, facts.toString())
         val critic = "You are a strict critic agent. Check this plan for a shy person: is each day small and specific, is anything " +
             "too scary or vague, does it fit the data? Return JSON only with the same fields focus, days (7 strings), why, " +
             "where you fixed every problem you found. Keep the language."
-        val checked = try { json(key, critic, "Data: $facts\nPlan: $draft") } catch (e: Exception) { draft }
+        val checked = try { json(c, key, critic, "Data: $facts\nPlan: $draft") } catch (e: Exception) { draft }
         val src = if ((checked.optJSONArray("days")?.length() ?: 0) == 7) checked else draft
         val days = src.optJSONArray("days") ?: throw Exception("Plan was empty")
         val out = JSONObject().put("week", LocalDate.now().toString()).put("focus", clean(src.optString("focus"), 80))
@@ -419,7 +500,14 @@ object Brain {
         val now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE yyyy-MM-dd HH:mm", Locale.ENGLISH))
         return "You are Jarvis, a warm and calm voice companion and phone assistant for $NAME. Now: $now. " +
             "Reply in ${STYLES[style]}. " +
-            "Your replies are spoken aloud, so use 1 to 3 short sentences, no markdown, no emoji. " +
+            "Your replies are spoken aloud, so never use markdown, lists, code blocks or emoji. " +
+            "Match the length to the question. Small talk gets 1 to 3 short sentences. " +
+            "A technical, study or work question gets a real expert answer: $NAME is an AI/ML engineer and computer science " +
+            "student, so skip the basics, name the exact method, library, parameter, number or trade-off, give your reasoning " +
+            "and a clear recommendation, in up to about 150 spoken words, then offer to go deeper. Never give a vague overview " +
+            "when a specific answer exists, and say so plainly when you are not sure. " +
+            "You have the conversation so far, a summary of earlier chats and saved facts below. If the user refers to " +
+            "something from an earlier chat that is not in front of you, call the recall tool before you answer, do not say you cannot remember. " +
             "Be a real friend: chat about the day, ask one natural follow up question, listen, and tell short stories " +
             "when asked (say it is a story you made up). The user is shy and dislikes crowds, so gently encourage " +
             "small real life social steps, never push or lecture. " +
@@ -456,6 +544,8 @@ object Brain {
         .put(fn("add_reminder", "Save a reminder notification for a date, optionally with a time.",
             JSONObject().put("text", S).put("when", JSONObject().put("type", "string").put("description", "YYYY-MM-DD or YYYY-MM-DDTHH:MM")), listOf("text", "when")))
         .put(fn("remember", "Save a lasting fact about the user (people, plans, likes).", JSONObject().put("fact", S), listOf("fact")))
+        .put(fn("recall", "Search all earlier chats stored on the phone. Use it when the user mentions something from a previous conversation.",
+            JSONObject().put("query", JSONObject().put("type", "string").put("description", "2 to 5 keywords")), listOf("query")))
         .put(fn("calendar_event", "Open a new calendar event for the user to review and save.",
             JSONObject().put("title", S).put("start", JSONObject().put("type", "string").put("description", "YYYY-MM-DDTHH:MM")).put("minutes", I), listOf("title", "start")))
         .put(fn("send_sms", "Prepare a text message (SMS) to a contact. The user reviews it and presses send.", JSONObject().put("name", S).put("message", S), listOf("name", "message")))
@@ -504,6 +594,19 @@ object Brain {
                     .put("start", st).put("minutes", a.optInt("minutes", 60).coerceIn(5, 1440))
             }
             "send_sms" -> CONFIRM to act("sms").put("name", clean(a.optString("name"), 40)).put("message", clean(a.optString("message"), 500))
+            "recall" -> {
+                // a plain keyword search over the chat log on the phone, the best lines go back to the model with their date
+                val words = clean(a.optString("query"), 100).lowercase().split(Regex("\\s+")).filter { it.length > 2 }
+                val log = arr(c, "log")
+                val hits = (0 until log.length()).map { log.getJSONObject(it) }
+                    .map { o -> o to words.count { w -> o.optString("x").lowercase().contains(w) } }
+                    .filter { it.second > 0 }.sortedByDescending { it.second }.take(8).sortedBy { it.first.optLong("t") }
+                if (hits.isEmpty()) "Nothing found in earlier chats." to null
+                else hits.joinToString("\n") { (o, _) ->
+                    val day = java.time.Instant.ofEpochMilli(o.optLong("t")).atZone(java.time.ZoneId.systemDefault()).toLocalDate()
+                    "$day ${if (o.optBoolean("m")) NAME else "Jarvis"}: ${o.optString("x").take(300)}"
+                } to null
+            }
             "remember" -> {
                 val mem = arr(c, "memory").put(clean(a.optString("fact"), 200))
                 prefs(c).edit().putString("memory", mem.toString()).apply()
